@@ -1,0 +1,79 @@
+// Copyright (C) 2025-2026 IRedDragonICY
+// SPDX-License-Identifier: Apache-2.0
+//
+// AFME (Adreno Frame Motion Engine) EGL Layer
+// Intercepts eglSwapBuffers to inject GPU-accelerated frame extrapolation
+// using Qualcomm's GL_QCOM_frame_extrapolation and GL_QCOM_motion_estimation.
+//
+// All GL functions are resolved dynamically via eglGetProcAddress —
+// the layer only links against libEGL for EGL calls and eglGetProcAddress.
+
+cc_library_shared {
+    name: "libAFME_layer",
+    vendor: true,
+
+    srcs: ["afme_layer.cpp"],
+
+    shared_libs: [
+        "libEGL",
+        "liblog",
+        "libcutils",
+    ],
+
+    header_libs: [
+        "gl_headers",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wno-unused-parameter",
+        "-fvisibility=hidden",
+        "-DLOG_TAG=\"AFME\"",
+        "-DEGL_EGLEXT_PROTOTYPES",
+    ],
+
+    ldflags: ["-Wl,--no-undefined"],
+
+    relative_install_path: "egl",
+}
+
+// AFME Vulkan Layer — intercepts vkQueuePresentKHR for frame generation
+// RE'd interface from libVkLayer_ADRENO_qprofiler.so + AOSP loader source
+// File MUST start with "libVkLayer" (layers_extensions.cpp line 435)
+// Layer name: VK_LAYER_AFME_frame_gen (set via gpu_debug_layers)
+// Search path: /data/local/debug/vulkan/ (layers_extensions.cpp line 67)
+
+cc_library_shared {
+    name: "libVkLayer_AFME",
+    vendor: true,
+
+    srcs: ["afme_vk_layer.cpp"],
+
+    shared_libs: [
+        "liblog",
+        "libcutils",
+        "libEGL",              // Hidden EGL context for AFME HW interop
+        "libGLESv3",           // GLES 3.0 functions (glFinish, glGenTextures, etc.)
+        "libnativewindow",     // AHardwareBuffer
+    ],
+
+    header_libs: [
+        "vulkan_headers",
+        "gl_headers",          // GLES type definitions
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wno-unused-parameter",
+        "-Wno-unused-function",
+        "-fvisibility=hidden",
+        "-DVK_USE_PLATFORM_ANDROID_KHR",
+    ],
+
+    ldflags: ["-Wl,--no-undefined"],
+
+    // Install to /vendor/lib64/egl/ (same as ADRENO_qprofiler)
+    relative_install_path: "egl",
+}
