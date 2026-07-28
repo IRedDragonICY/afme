@@ -67,6 +67,7 @@
 #include <cutils/properties.h>
 
 #include "afme_core.h"
+#include "afme_filter.h"
 
 // ─── Android EGL Layer types (not in standard EGL headers) ──────────────────
 // Defined by Android's GLES layer loading system.
@@ -137,6 +138,7 @@ typedef GLint (*PFNGLGETUNIFORMLOCATIONPROC_)(GLuint, const GLchar*);
 typedef void (*PFNGLUNIFORM1IPROC_)(GLint, GLint);
 typedef void (*PFNGLUNIFORM1FPROC_)(GLint, GLfloat);
 typedef void (*PFNGLUNIFORM2FPROC_)(GLint, GLfloat, GLfloat);
+typedef void (*PFNGLUNIFORM4FPROC_)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void (*PFNGLGENVERTEXARRAYSPROC_)(GLsizei, GLuint*);
 typedef void (*PFNGLBINDVERTEXARRAYPROC_)(GLuint);
 typedef void (*PFNGLDELETEVERTEXARRAYSPROC_)(GLsizei, const GLuint*);
@@ -206,6 +208,7 @@ struct GLFuncs {
     PFNGLUNIFORM1IPROC_          Uniform1i = nullptr;
     PFNGLUNIFORM1FPROC_          Uniform1f = nullptr;
     PFNGLUNIFORM2FPROC_          Uniform2f = nullptr;
+    PFNGLUNIFORM4FPROC_          Uniform4f = nullptr;
     PFNGLGENVERTEXARRAYSPROC_    GenVertexArrays = nullptr;
     PFNGLBINDVERTEXARRAYPROC_    BindVertexArray = nullptr;
     PFNGLDELETEVERTEXARRAYSPROC_ DeleteVertexArrays = nullptr;
@@ -318,6 +321,12 @@ struct AFMEState {
     afme::Stats stats;
     afme::EngagementGate gate;
 
+    // Color filter. stageTex holds the untouched backbuffer; the grade writes
+    // into currTex, which then goes back to the backbuffer AND feeds frame
+    // generation — so synthetic frames inherit the grade for free.
+    GLuint stageTex = 0;
+    afme::Filter filter;
+
     // ── Motion-estimation resources (method=1 only) ──
     bool motionReady = false;      // ME path fully initialized
     bool motionAttempted = false;  // don't retry setup every frame on failure
@@ -400,6 +409,7 @@ void resolveGLFunctions() {
     RESOLVE(Uniform1i, PFNGLUNIFORM1IPROC_, "glUniform1i");
     RESOLVE(Uniform1f, PFNGLUNIFORM1FPROC_, "glUniform1f");
     RESOLVE(Uniform2f, PFNGLUNIFORM2FPROC_, "glUniform2f");
+    RESOLVE(Uniform4f, PFNGLUNIFORM4FPROC_, "glUniform4f");
     RESOLVE(GenVertexArrays, PFNGLGENVERTEXARRAYSPROC_, "glGenVertexArrays");
     RESOLVE(BindVertexArray, PFNGLBINDVERTEXARRAYPROC_, "glBindVertexArray");
     RESOLVE(DeleteVertexArrays, PFNGLDELETEVERTEXARRAYSPROC_, "glDeleteVertexArrays");
@@ -435,6 +445,46 @@ void resolveGLFunctions() {
     } else {
         ALOGW("AFME: glBlitFramebuffer NOT available — cannot operate");
     }
+}
+
+// The filter reaches GL through a dispatch struct rather than direct calls,
+// because this layer resolves every entry point at runtime and links only
+// libEGL — see afme_filter.h.
+afme::FilterGL sFilterGl;
+bool sFilterGlReady = false;
+
+void initFilterGl() {
+    if (sFilterGlReady) return;
+    sFilterGl.CreateShader = sGL.CreateShader;
+    sFilterGl.ShaderSource = sGL.ShaderSource;
+    sFilterGl.CompileShader = sGL.CompileShader;
+    sFilterGl.GetShaderiv = sGL.GetShaderiv;
+    sFilterGl.GetShaderInfoLog = sGL.GetShaderInfoLog;
+    sFilterGl.DeleteShader = sGL.DeleteShader;
+    sFilterGl.CreateProgram = sGL.CreateProgram;
+    sFilterGl.AttachShader = sGL.AttachShader;
+    sFilterGl.LinkProgram = sGL.LinkProgram;
+    sFilterGl.GetProgramiv = sGL.GetProgramiv;
+    sFilterGl.GetProgramInfoLog = sGL.GetProgramInfoLog;
+    sFilterGl.DeleteProgram = sGL.DeleteProgram;
+    sFilterGl.UseProgram = sGL.UseProgram;
+    sFilterGl.GetUniformLocation = sGL.GetUniformLocation;
+    sFilterGl.Uniform1i = sGL.Uniform1i;
+    sFilterGl.Uniform4f = sGL.Uniform4f;
+    sFilterGl.GenFramebuffers = sGL.GenFramebuffers;
+    sFilterGl.DeleteFramebuffers = sGL.DeleteFramebuffers;
+    sFilterGl.BindFramebuffer = sGL.BindFramebuffer;
+    sFilterGl.FramebufferTexture2D = sGL.FramebufferTexture2D;
+    sFilterGl.GenVertexArrays = sGL.GenVertexArrays;
+    sFilterGl.DeleteVertexArrays = sGL.DeleteVertexArrays;
+    sFilterGl.BindVertexArray = sGL.BindVertexArray;
+    sFilterGl.ActiveTexture = sGL.ActiveTexture;
+    sFilterGl.BindTexture = sGL.BindTexture;
+    sFilterGl.TexParameteri = sGL.TexParameteri;
+    sFilterGl.Viewport = sGL.Viewport;
+    sFilterGl.DrawArrays = sGL.DrawArrays;
+    sFilterGl.Disable = sGL.Disable;
+    sFilterGlReady = true;
 }
 
 // ─── GL state isolation ─────────────────────────────────────────────────────
@@ -828,6 +878,8 @@ void cleanupState(AFMEState& state) {
         if (state.prevTex) { sGL.DeleteTextures(1, &state.prevTex); state.prevTex = 0; }
         if (state.currTex) { sGL.DeleteTextures(1, &state.currTex); state.currTex = 0; }
         if (state.synthTex) { sGL.DeleteTextures(1, &state.synthTex); state.synthTex = 0; }
+        if (state.stageTex) { sGL.DeleteTextures(1, &state.stageTex); state.stageTex = 0; }
+        state.filter.destroy();
         if (state.prevLumaTex) { sGL.DeleteTextures(1, &state.prevLumaTex); state.prevLumaTex = 0; }
         if (state.currLumaTex) { sGL.DeleteTextures(1, &state.currLumaTex); state.currLumaTex = 0; }
         if (state.mvBlockTex) { sGL.DeleteTextures(1, &state.mvBlockTex); state.mvBlockTex = 0; }
@@ -867,6 +919,10 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     static uint64_t sPresentCount = 0;
     if ((sPresentCount++ % afme::kPollInterval) == 0) {
         afme::config().poll();
+        afme::pollFilterProps();
+    } else if (afme::filterLive()) {
+        // GameSpace has the filter panel open: follow every slider movement.
+        afme::pollFilterProps();
     }
 
     if (!afme::config().enabled.load(std::memory_order_relaxed)) {
@@ -919,10 +975,19 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     const int mult = afme::config().multiplier.load(std::memory_order_relaxed);
     const int hz = afme::config().displayHz.load(std::memory_order_relaxed);
     const afme::Pacer::Tier tier = state->pacer.beginPresent(nowNs, mult, hz);
-    const int numGenFrames = tier.numGen;
 
-    if (numGenFrames == 0) {
-        // The game already fills the panel by itself: stay out of the way.
+    // Frame generation and the color filter are independent features: a
+    // filter-only session is legitimate, and generation must not be a
+    // precondition for grading.
+    const bool fgOn = afme::config().fg.load(std::memory_order_relaxed);
+    const int numGenFrames = fgOn ? tier.numGen : 0;
+
+    const afme::FilterParams fp = afme::filterParams();
+    const bool filterOn = afme::filterEnabled() && !fp.isIdentity() &&
+                          !state->filter.failed();
+
+    if (numGenFrames == 0 && !filterOn) {
+        // Nothing to do: the game already fills the panel and no grade is set.
         state->hasPrevFrame = false;
         state->hasLumaHistory = false;
         state->pacer.abortPresent(nowNs);
@@ -941,6 +1006,39 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     guard.save();
     guard.neutralize();
 
+    // Step 1: Capture the current frame, grading it on the way in when the
+    // filter is on. The grade lands in currTex, so it reaches BOTH the real
+    // frame (blitted back to the backbuffer just below) and every synthetic
+    // frame generated from currTex — one pass per real frame at any multiplier.
+    if (filterOn) {
+        if (!state->stageTex) {
+            state->stageTex = createTexture(state->width, state->height);
+        }
+        initFilterGl();
+        if (state->stageTex && state->filter.init(sFilterGl)) {
+            captureFramebuffer(*state, state->stageTex);
+            state->filter.apply(state->stageTex, state->currTex,
+                                state->width, state->height, fp);
+            blitTextureToFramebuffer(*state, state->currTex);
+        } else {
+            captureFramebuffer(*state, state->currTex);
+        }
+    } else {
+        captureFramebuffer(*state, state->currTex);
+    }
+
+    // Filter-only session: the graded frame is already in the backbuffer, so
+    // present it and skip everything generation-related.
+    if (numGenFrames == 0) {
+        drainGLErrors(*state, "filter");
+        guard.restore();
+        state->hasPrevFrame = false;
+        state->hasLumaHistory = false;
+        state->pacer.abortPresent(nowNs);
+        state->stats.publish(nowNs);
+        return nextSwap(dpy, surface);
+    }
+
     // Lazily bring up the motion-estimation path the first time it is asked
     // for. If it cannot be built we degrade to extrapolation rather than
     // dropping frame generation altogether.
@@ -951,9 +1049,6 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         }
         useMotion = state->motionReady;
     }
-
-    // Step 1: Capture current frame
-    captureFramebuffer(*state, state->currTex);
 
     // Step 2: For the motion path, derive this frame's luminance while the
     // real frame is still the newest thing we have. Runs once per real frame

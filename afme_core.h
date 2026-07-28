@@ -70,8 +70,12 @@ public:
     /** True when the motion-estimation pipeline should be built and used. */
     bool wantMotion() const;
 
-    // Master
+    // Master. `enabled` means the layer is ARMED for this app; `fg` means
+    // frame generation specifically. They are separate so the color filter can
+    // run in a session with no generation at all — and so a filter-only session
+    // does not inflate the swapchain, force FIFO, or lock the refresh rate.
     std::atomic<bool>  enabled{false};        // persist.sys.afme.enable
+    std::atomic<bool>  fg{true};              // persist.sys.afme.fg
     std::atomic<int>   multiplier{2};         // 2 / 3 / 4
     std::atomic<int>   method{kExtrapolate};
     std::atomic<float> factorOverride{0.0f};  // 0 = auto phase

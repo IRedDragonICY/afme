@@ -49,6 +49,7 @@
 #include <cutils/properties.h>
 
 #include "afme_core.h"
+#include "afme_filter.h"
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 #define LOG_TAG "AFME"
@@ -275,6 +276,62 @@ bool initDeviceFunc(VkDevice device, const char* name, T* func) {
     return true;
 }
 
+// The filter runs on this layer's private GLES context, so the entry points are
+// simply the ones we link. (The GLES layer fills the same struct from
+// eglGetProcAddress — see afme_filter.h for why it is a struct at all.)
+static afme::FilterGL gFilterGl;
+static std::once_flag gFilterGlOnce;
+
+static void initFilterGl() {
+    std::call_once(gFilterGlOnce, [] {
+        gFilterGl.CreateShader = glCreateShader;
+        gFilterGl.ShaderSource = glShaderSource;
+        gFilterGl.CompileShader = glCompileShader;
+        gFilterGl.GetShaderiv = glGetShaderiv;
+        gFilterGl.GetShaderInfoLog = glGetShaderInfoLog;
+        gFilterGl.DeleteShader = glDeleteShader;
+        gFilterGl.CreateProgram = glCreateProgram;
+        gFilterGl.AttachShader = glAttachShader;
+        gFilterGl.LinkProgram = glLinkProgram;
+        gFilterGl.GetProgramiv = glGetProgramiv;
+        gFilterGl.GetProgramInfoLog = glGetProgramInfoLog;
+        gFilterGl.DeleteProgram = glDeleteProgram;
+        gFilterGl.UseProgram = glUseProgram;
+        gFilterGl.GetUniformLocation = glGetUniformLocation;
+        gFilterGl.Uniform1i = glUniform1i;
+        gFilterGl.Uniform4f = glUniform4f;
+        gFilterGl.GenFramebuffers = glGenFramebuffers;
+        gFilterGl.DeleteFramebuffers = glDeleteFramebuffers;
+        gFilterGl.BindFramebuffer = glBindFramebuffer;
+        gFilterGl.FramebufferTexture2D = glFramebufferTexture2D;
+        gFilterGl.GenVertexArrays = glGenVertexArrays;
+        gFilterGl.DeleteVertexArrays = glDeleteVertexArrays;
+        gFilterGl.BindVertexArray = glBindVertexArray;
+        gFilterGl.ActiveTexture = glActiveTexture;
+        gFilterGl.BindTexture = glBindTexture;
+        gFilterGl.TexParameteri = glTexParameteri;
+        gFilterGl.Viewport = glViewport;
+        gFilterGl.DrawArrays = glDrawArrays;
+        gFilterGl.Disable = glDisable;
+    });
+}
+
+// The AHB staging buffer is allocated AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, so
+// a 10-bit or FP16 swapchain would round-trip the REAL frame through 8 bits.
+// That is invisible while we only read the frame for generation, but the filter
+// copies its result back — so refuse rather than quietly degrade the game.
+static bool is8BitSwapchain(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& memProps,
                                 uint32_t typeFilter, VkMemoryPropertyFlags flags) {
     for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
@@ -350,6 +407,15 @@ struct AFMEContext {
     afme::Pacer pacer;
     afme::Stats stats;
     afme::EngagementGate gate;
+
+    // Color filter. stageFrame holds the untouched present image; the filter
+    // grades it INTO currFrame, so generation and the real frame both see the
+    // graded result and the grade costs one pass per real frame at any
+    // multiplier. Allocated lazily — a session that never enables the filter
+    // pays nothing.
+    AHBImage stageFrame;
+    afme::Filter filter;
+    bool filterUnsupported = false;   // non-8-bit swapchain: refuse, do not degrade
 
     // MobFGSR is built at swapchain creation, but the method property can flip
     // mid-session; this lets us build it on first use without retrying forever.
@@ -2079,7 +2145,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
     static std::atomic<uint64_t> sPresentCount{0};
     const uint64_t fc = sPresentCount.fetch_add(1);
-    if ((fc % afme::kPollInterval) == 0) afme::config().poll();
+    if ((fc % afme::kPollInterval) == 0) {
+        afme::config().poll();
+        afme::pollFilterProps();
+    } else if (afme::filterLive()) {
+        // GameSpace has the filter panel open: follow every slider movement.
+        afme::pollFilterProps();
+    }
 
     if (!afme::config().enabled.load(std::memory_order_relaxed)) {
         return next_vkQueuePresentKHR(queue, pPresentInfo);
@@ -2219,7 +2291,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     const int64_t nowNs = afme::nowNs();
     const afme::Pacer::Tier tier =
             ctx.pacer.beginPresent(nowNs, mult, effectiveHz(ctx));
-    const int numGenFrames = tier.numGen;
+    // Frame generation and the color filter are independent features: a
+    // filter-only session is legitimate, and generation must not be a
+    // precondition for grading.
+    const bool fgOn = afme::config().fg.load(std::memory_order_relaxed);
+    const int numGenFrames = fgOn ? tier.numGen : 0;
+
+    const afme::FilterParams fp = afme::filterParams();
+    bool filterOn = afme::filterEnabled() && !fp.isIdentity() &&
+                    !ctx.filterUnsupported && !ctx.filter.failed();
+    if (filterOn && !is8BitSwapchain(ctx.format)) {
+        ALOGW("AFME: color filter disabled — swapchain format %d is not 8-bit, "
+              "and the staging buffer would truncate the real frame",
+              (int)ctx.format);
+        ctx.filterUnsupported = true;
+        filterOn = false;
+    }
+    if (filterOn && !ctx.stageFrame.valid) {
+        if (!createAHBImage(ctx, ctx.stageFrame, ctx.extent.width,
+                            ctx.extent.height)) {
+            ALOGE("AFME: filter staging buffer allocation failed");
+            ctx.filterUnsupported = true;
+            filterOn = false;
+        }
+    }
 
     // Every present the game makes is a real frame, whether or not we generate
     // from it. Counting it only on the generating path reported real=0 for the
@@ -2227,8 +2322,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     // correctly, and the overlay reads one channel from both.
     ctx.stats.addReal();
 
-    if (numGenFrames == 0) {
-        // Game already fills the panel by itself: stay out of the way.
+    if (numGenFrames == 0 && !filterOn) {
+        // Nothing to do: the game already fills the panel and no grade is set.
         // The committed tier deliberately survives this path — see
         // afme::Pacer::abortPresent().
         ctx.hasPrevFrame = false;
@@ -2247,7 +2342,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     // The motion method interpolates, so it must hold the real frame back until
     // the synthetic one is ready; extrapolation presents the real frame first.
     // Falls back to extrapolation if MobFGSR could not be built for this ctx.
-    const bool interpolation = (afme::config().wantMotion() && ctx.mobfgsrInitialized);
+    const bool interpolation = numGenFrames > 0 &&
+                               afme::config().wantMotion() && ctx.mobfgsrInitialized;
     // Visibility for a silent downgrade: a failed MobFGSR build used to look
     // identical in logcat to interpolation working. One WARN per 300 frames.
     if (afme::config().wantMotion() && !ctx.mobfgsrInitialized && ctx.mobfgsrAttempted
@@ -2255,23 +2351,33 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         ALOGW("AFME: method=motion requested but MobFGSR unavailable for this "
               "swapchain — falling back to extrapolation (see init errors above)");
     }
-    const bool generate = ctx.hasPrevFrame;
+    // Only generate when generation is on AND a tier was chosen for it.
+    const bool generate = ctx.hasPrevFrame && numGenFrames > 0;
+
+    // With the filter on, the present image is copied into stageFrame and the
+    // grade writes into currFrame; without it, straight into currFrame as before.
+    const VkImage copyDst = filterOn ? ctx.stageFrame.vkImage
+                                     : ctx.currFrame.vkImage;
 
     // Step 1: Copy swapchain → currFrame (Vulkan blit). Waits the game's
     // present semaphores on the GPU; signals copyDoneSem for the
     // extrapolation-mode real present. The CPU does NOT wait here.
-    VkSemaphore copyDoneSem = interpolation ? VK_NULL_HANDLE : ctx.acquireSem();
+    // With the filter on, the real present waits the grade's write-back instead
+    // (signalled further down); a semaphore signalled but never waited would
+    // leak pool state, so do not take one.
+    VkSemaphore copyDoneSem =
+            (interpolation || filterOn) ? VK_NULL_HANDLE : ctx.acquireSem();
     {
         VkCommandBuffer cmd = ctx.acquireCmd();
         if (cmd == VK_NULL_HANDLE) cmd = allocCmdBuf(ctx); // fallback
         next_vkResetCommandBuffer(cmd, 0);
         beginCmd(cmd);
-        cmdCopyImage(cmd, swapImg, ctx.currFrame.vkImage,
+        cmdCopyImage(cmd, swapImg, copyDst,
                      ctx.extent.width, ctx.extent.height,
                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, true,
                      VK_IMAGE_LAYOUT_UNDEFINED, false);
-        // Leave currFrame in GENERAL for GLES to read
-        cmdBarrier(cmd, ctx.currFrame.vkImage,
+        // Leave the destination in GENERAL for GLES to read
+        cmdBarrier(cmd, copyDst,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -2316,14 +2422,129 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     VkResult finalResult = VK_SUCCESS;
     bool synthSubmitted = false;
 
+    // ── Step 1b: grade ───────────────────────────────────────────────────
+    // stageFrame → currFrame on the private GLES context, then currFrame back
+    // into the present image so the REAL frame is graded too. Generation later
+    // reads currFrame/prevFrame, which are now graded, so synthetic frames
+    // inherit the grade at no extra cost.
+    VkSemaphore filterDoneSem = VK_NULL_HANDLE;
+    if (filterOn) {
+        // GLES must not read stageFrame before the copy lands. Same GPU-side
+        // wait the generation path uses; CPU fence wait as the fallback.
+        int copyFd = -2;
+        if (ctx.hasNativeFenceSync && next_vkGetFenceFdKHR) {
+            VkFenceGetFdInfoKHR fdInfo = {};
+            fdInfo.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR;
+            fdInfo.fence = ctx.copyFence;
+            fdInfo.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+            if (next_vkGetFenceFdKHR(ctx.device, &fdInfo, &copyFd) != VK_SUCCESS)
+                copyFd = -2;
+        }
+        if (copyFd == -2)
+            next_vkWaitForFences(ctx.device, 1, &ctx.copyFence, VK_TRUE,
+                                 16000000ULL);
+
+        EGLDisplay oldDpy = eglGetCurrentDisplay();
+        EGLSurface oldRead = eglGetCurrentSurface(EGL_READ);
+        EGLSurface oldDraw = eglGetCurrentSurface(EGL_DRAW);
+        EGLContext oldCtx = eglGetCurrentContext();
+        eglMakeCurrent(ctx.eglDpy, ctx.eglSurf, ctx.eglSurf, ctx.eglCtx);
+
+        if (copyFd >= 0) {
+            EGLint syncAttrs[] = { EGL_SYNC_NATIVE_FENCE_FD_ANDROID, copyFd,
+                                   EGL_NONE };
+            EGLSyncKHR copySync = ctx.eglCreateSyncKHR_(
+                    ctx.eglDpy, EGL_SYNC_NATIVE_FENCE_ANDROID, syncAttrs);
+            if (copySync != EGL_NO_SYNC_KHR) {
+                ctx.eglWaitSyncKHR_(ctx.eglDpy, copySync, 0);
+                ctx.eglDestroySyncKHR_(ctx.eglDpy, copySync);
+            } else {
+                close(copyFd);
+                next_vkWaitForFences(ctx.device, 1, &ctx.copyFence, VK_TRUE,
+                                     16000000ULL);
+            }
+        }
+
+        initFilterGl();
+        if (ctx.filter.init(gFilterGl)) {
+            ctx.filter.apply(ctx.stageFrame.glTex, ctx.currFrame.glTex,
+                             ctx.extent.width, ctx.extent.height, fp);
+        } else {
+            filterOn = false;
+        }
+
+        // Hand the grade back to Vulkan the same way generation does.
+        bool filterSemValid = false;
+        if (filterOn && ctx.hasNativeFenceSync &&
+            ctx.genDoneSem != VK_NULL_HANDLE && next_vkImportSemaphoreFdKHR) {
+            EGLSyncKHR fSync = ctx.eglCreateSyncKHR_(
+                    ctx.eglDpy, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+            if (fSync != EGL_NO_SYNC_KHR) {
+                glFlush();
+                int fFd = ctx.eglDupNativeFenceFD_(ctx.eglDpy, fSync);
+                ctx.eglDestroySyncKHR_(ctx.eglDpy, fSync);
+                if (fFd >= 0) {
+                    VkImportSemaphoreFdInfoKHR imp = {};
+                    imp.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+                    imp.semaphore = ctx.genDoneSem;
+                    imp.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+                    imp.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+                    imp.fd = fFd;
+                    if (next_vkImportSemaphoreFdKHR(ctx.device, &imp) == VK_SUCCESS)
+                        filterSemValid = true;
+                    else
+                        close(fFd);
+                }
+            }
+        }
+        if (filterOn && !filterSemValid) glFinish();
+
+        if (oldCtx != EGL_NO_CONTEXT) {
+            eglMakeCurrent(oldDpy, oldDraw, oldRead, oldCtx);
+        } else {
+            eglMakeCurrent(ctx.eglDpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                           EGL_NO_CONTEXT);
+        }
+
+        if (filterOn) {
+            // Write the graded frame back into the image the game is presenting.
+            filterDoneSem = ctx.acquireSem();
+            VkCommandBuffer cmd = ctx.acquireCmd();
+            if (cmd == VK_NULL_HANDLE) cmd = allocCmdBuf(ctx);
+            next_vkResetCommandBuffer(cmd, 0);
+            beginCmd(cmd);
+            cmdCopyImage(cmd, ctx.currFrame.vkImage, swapImg,
+                         ctx.extent.width, ctx.extent.height,
+                         VK_IMAGE_LAYOUT_GENERAL, false,
+                         VK_IMAGE_LAYOUT_UNDEFINED, true);
+            next_vkEndCommandBuffer(cmd);
+
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo si = {};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cmd;
+            si.waitSemaphoreCount = filterSemValid ? 1u : 0u;
+            si.pWaitSemaphores = &ctx.genDoneSem;
+            si.pWaitDstStageMask = &waitStage;
+            if (filterDoneSem != VK_NULL_HANDLE) {
+                si.signalSemaphoreCount = 1;
+                si.pSignalSemaphores = &filterDoneSem;
+            }
+            next_vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        }
+    }
+
     // Step 2a (extrapolation): REAL frame goes out immediately — the
     // presentation engine waits copyDoneSem, the game thread keeps running.
     if (!interpolation) {
         VkPresentInfoKHR realPresent = {};
         realPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         realPresent.pNext = pPresentInfo->pNext;
-        realPresent.waitSemaphoreCount = (copyDoneSem != VK_NULL_HANDLE) ? 1u : 0u;
-        realPresent.pWaitSemaphores = &copyDoneSem;
+        const VkSemaphore realWait =
+                (filterDoneSem != VK_NULL_HANDLE) ? filterDoneSem : copyDoneSem;
+        realPresent.waitSemaphoreCount = (realWait != VK_NULL_HANDLE) ? 1u : 0u;
+        realPresent.pWaitSemaphores = &realWait;
         realPresent.swapchainCount = 1;
         realPresent.pSwapchains = &swapchain;
         realPresent.pImageIndices = &presentIdx;
@@ -2614,7 +2835,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         VkPresentInfoKHR realPresent = {};
         realPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         realPresent.pNext = pPresentInfo->pNext;
-        realPresent.waitSemaphoreCount = 0;  // copy fence already waited
+        realPresent.waitSemaphoreCount =
+                (filterDoneSem != VK_NULL_HANDLE) ? 1u : 0u;
+        realPresent.pWaitSemaphores = &filterDoneSem;
         realPresent.swapchainCount = 1;
         realPresent.pSwapchains = &swapchain;
         realPresent.pImageIndices = &presentIdx;

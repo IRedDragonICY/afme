@@ -73,6 +73,9 @@ Config& config() {
 
 void Config::poll() {
     enabled.store(propBool("persist.sys.afme.enable", "0"));
+    // Defaults ON so an existing setup, which only ever sets .enable when a
+    // multiplier is configured, keeps generating exactly as before.
+    fg.store(propBool("persist.sys.afme.fg", "1"));
 
     // Invalid values keep the previous setting rather than snapping to a
     // default: a transiently empty property during a GameSpace write must not

@@ -39,6 +39,27 @@ cc_library_static {
     export_include_dirs: ["."],
 }
 
+// Real-time color grading applied inside the game's own present. Separate from
+// libAFME_core because it does need GL types; still dispatch-based rather than
+// linking GL, for the same reason (libAFME_layer has no libGLESv3).
+cc_library_static {
+    name: "libAFME_filter",
+    defaults: ["afme_defaults"],
+
+    srcs: ["afme_filter.cpp"],
+
+    shared_libs: [
+        "liblog",
+        "libcutils",
+    ],
+
+    header_libs: [
+        "gl_headers",
+    ],
+
+    export_include_dirs: ["."],
+}
+
 // AFME (Adreno Frame Motion Engine) EGL Layer
 // Intercepts eglSwapBuffers to inject GPU-accelerated frame extrapolation
 // using Qualcomm's GL_QCOM_frame_extrapolation and GL_QCOM_motion_estimation.
@@ -51,7 +72,10 @@ cc_library_shared {
 
     srcs: ["afme_layer.cpp"],
 
-    static_libs: ["libAFME_core"],
+    static_libs: [
+        "libAFME_core",
+        "libAFME_filter",
+    ],
 
     shared_libs: [
         "libEGL",
@@ -86,7 +110,10 @@ cc_library_shared {
 
     srcs: ["afme_vk_layer.cpp"],
 
-    static_libs: ["libAFME_core"],
+    static_libs: [
+        "libAFME_core",
+        "libAFME_filter",
+    ],
 
     shared_libs: [
         "liblog",
