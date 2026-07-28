@@ -307,6 +307,10 @@ static void initFilterGl() {
         gFilterGl.GenVertexArrays = glGenVertexArrays;
         gFilterGl.DeleteVertexArrays = glDeleteVertexArrays;
         gFilterGl.BindVertexArray = glBindVertexArray;
+        gFilterGl.GenTextures = glGenTextures;
+        gFilterGl.DeleteTextures = glDeleteTextures;
+        gFilterGl.TexStorage2D = glTexStorage2D;
+        gFilterGl.GenerateMipmap = glGenerateMipmap;
         gFilterGl.ActiveTexture = glActiveTexture;
         gFilterGl.BindTexture = glBindTexture;
         gFilterGl.TexParameteri = glTexParameteri;
@@ -414,6 +418,13 @@ struct AFMEContext {
     // multiplier. Allocated lazily — a session that never enables the filter
     // pays nothing.
     AHBImage stageFrame;
+    // Stage B output. Only allocated when a screen-space effect is actually
+    // set, because it is a full extra frame of memory.
+    AHBImage presentFrame;
+    // Generation scratch: with stage B on, synthesis writes here and stage B
+    // copies out to the synth AHB, since a pass cannot read and write one
+    // texture. Without stage B, synthesis writes the AHB directly as before.
+    GLuint genScratchTex = 0;
     afme::Filter filter;
     bool filterUnsupported = false;   // non-8-bit swapchain: refuse, do not degrade
 
@@ -2316,6 +2327,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         }
     }
 
+    // Stage B holds the screen-space effects — vignette, grain, letterbox —
+    // which must run AFTER generation on every present, or the motion field
+    // would warp them off the screen and the grain would be read as motion.
+    bool stageB = filterOn && fp.hasStageB();
+    if (stageB && !ctx.presentFrame.valid) {
+        if (!createAHBImage(ctx, ctx.presentFrame, ctx.extent.width,
+                            ctx.extent.height)) {
+            ALOGE("AFME: stage-B buffer allocation failed — "
+                  "screen-space effects disabled");
+            stageB = false;
+        }
+    }
+
     // Every present the game makes is a real frame, whether or not we generate
     // from it. Counting it only on the generating path reported real=0 for the
     // whole time the panel had no headroom — the GLES layer already did this
@@ -2467,8 +2491,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
         initFilterGl();
         if (ctx.filter.init(gFilterGl)) {
-            ctx.filter.apply(ctx.stageFrame.glTex, ctx.currFrame.glTex,
-                             ctx.extent.width, ctx.extent.height, fp);
+        ctx.filter.applyStageA(ctx.stageFrame.glTex, ctx.currFrame.glTex,
+                                   ctx.extent.width, ctx.extent.height, fp);
+            if (stageB) {
+                ctx.filter.applyStageB(ctx.currFrame.glTex,
+                                       ctx.presentFrame.glTex,
+                                       ctx.extent.width, ctx.extent.height,
+                                       fp, ctx.frameIdx);
+            }
         } else {
             filterOn = false;
         }
@@ -2513,7 +2543,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             if (cmd == VK_NULL_HANDLE) cmd = allocCmdBuf(ctx);
             next_vkResetCommandBuffer(cmd, 0);
             beginCmd(cmd);
-            cmdCopyImage(cmd, ctx.currFrame.vkImage, swapImg,
+            cmdCopyImage(cmd,
+                         stageB ? ctx.presentFrame.vkImage
+                                : ctx.currFrame.vkImage,
+                         swapImg,
                          ctx.extent.width, ctx.extent.height,
                          VK_IMAGE_LAYOUT_GENERAL, false,
                          VK_IMAGE_LAYOUT_UNDEFINED, true);
@@ -2627,6 +2660,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             applyMobFGSRPrepare(ctx);
         }
 
+        if (stageB && !ctx.genScratchTex) {
+            ctx.genScratchTex = createGLTex(GL_RGBA8, ctx.extent.width,
+                                            ctx.extent.height, GL_LINEAR);
+            if (!ctx.genScratchTex) stageB = false;
+        }
+
         float userFactor = afme::config().factorOverride.load();  // 0 = auto
         for (int i = 0; i < numGenFrames; i++) {
             // Divide by the ACTUAL number of presents per interval
@@ -2642,19 +2681,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
                 // ═══ MobFGSR interpolation ═══
                 applyMobFGSRWarp(ctx, factor);
 
-                // Copy MobFGSR result → synth AHB image for Vulkan present
-                glCopyImageSubData(
-                    ctx.fgResultTex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                    ctx.synthFrames[i].glTex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                    ctx.extent.width, ctx.extent.height, 1);
+                if (stageB) {
+                    // Stage B REPLACES the result→AHB copy here rather than
+                    // adding a pass: it has to read fgResultTex and write the
+                    // AHB either way.
+                    ctx.filter.applyStageB(ctx.fgResultTex,
+                                           ctx.synthFrames[i].glTex,
+                                           ctx.extent.width, ctx.extent.height,
+                                           fp, ctx.frameIdx * 8 + (uint64_t)i);
+                } else {
+                    glCopyImageSubData(
+                        ctx.fgResultTex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                        ctx.synthFrames[i].glTex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                        ctx.extent.width, ctx.extent.height, 1);
+                }
             } else {
                 // ═══ HW Extrapolation (modes 0-2) ═══
+                // A pass cannot read and write one texture, so with stage B on
+                // the driver writes scratch and stage B copies out.
                 ctx.glExtrapolateTex2D(
                     srcPrevTex,
                     srcCurrTex,
-                    ctx.synthFrames[i].glTex,
+                    stageB ? ctx.genScratchTex : ctx.synthFrames[i].glTex,
                     factor
                 );
+                if (stageB) {
+                    ctx.filter.applyStageB(ctx.genScratchTex,
+                                           ctx.synthFrames[i].glTex,
+                                           ctx.extent.width, ctx.extent.height,
+                                           fp, ctx.frameIdx * 8 + (uint64_t)i);
+                }
             }
 
             if ((fc % 300) == 0 && i == 0) {

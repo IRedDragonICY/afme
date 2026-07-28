@@ -107,6 +107,7 @@ typedef void (*PFNGLTEXIMAGE2DPROC_)(GLenum, GLint, GLint, GLsizei, GLsizei,
 typedef void (*PFNGLTEXSTORAGE2DPROC_)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
 typedef void (*PFNGLTEXPARAMETERIPROC_)(GLenum, GLenum, GLint);
 typedef void (*PFNGLACTIVETEXTUREPROC_)(GLenum);
+typedef void (*PFNGLGENERATEMIPMAPPROC_)(GLenum);
 typedef void (*PFNGLFINISHPROC)(void);
 typedef void (*PFNGLFLUSHPROC)(void);
 typedef void (*PFNGLGETINTEGERVPROC_)(GLenum, GLint*);
@@ -178,6 +179,7 @@ struct GLFuncs {
     PFNGLTEXSTORAGE2DPROC_       TexStorage2D = nullptr;
     PFNGLTEXPARAMETERIPROC_      TexParameteri = nullptr;
     PFNGLACTIVETEXTUREPROC_      ActiveTexture = nullptr;
+    PFNGLGENERATEMIPMAPPROC_     GenerateMipmap = nullptr;
     PFNGLFINISHPROC              Finish = nullptr;
     PFNGLFLUSHPROC               Flush = nullptr;
     PFNGLGETINTEGERVPROC_        GetIntegerv = nullptr;
@@ -325,6 +327,10 @@ struct AFMEState {
     // into currTex, which then goes back to the backbuffer AND feeds frame
     // generation — so synthetic frames inherit the grade for free.
     GLuint stageTex = 0;
+    // Stage B output, and the generation scratch a stage-B pass needs because
+    // it cannot read and write one texture. Both allocated only on demand.
+    GLuint presentTex = 0;
+    GLuint genScratchTex = 0;
     afme::Filter filter;
 
     // ── Motion-estimation resources (method=1 only) ──
@@ -378,6 +384,7 @@ void resolveGLFunctions() {
     RESOLVE(TexStorage2D, PFNGLTEXSTORAGE2DPROC_, "glTexStorage2D");
     RESOLVE(TexParameteri, PFNGLTEXPARAMETERIPROC_, "glTexParameteri");
     RESOLVE(ActiveTexture, PFNGLACTIVETEXTUREPROC_, "glActiveTexture");
+    RESOLVE(GenerateMipmap, PFNGLGENERATEMIPMAPPROC_, "glGenerateMipmap");
     RESOLVE(Finish, PFNGLFINISHPROC, "glFinish");
     RESOLVE(Flush, PFNGLFLUSHPROC, "glFlush");
     RESOLVE(GetIntegerv, PFNGLGETINTEGERVPROC_, "glGetIntegerv");
@@ -478,6 +485,10 @@ void initFilterGl() {
     sFilterGl.GenVertexArrays = sGL.GenVertexArrays;
     sFilterGl.DeleteVertexArrays = sGL.DeleteVertexArrays;
     sFilterGl.BindVertexArray = sGL.BindVertexArray;
+    sFilterGl.GenTextures = sGL.GenTextures;
+    sFilterGl.DeleteTextures = sGL.DeleteTextures;
+    sFilterGl.TexStorage2D = sGL.TexStorage2D;
+    sFilterGl.GenerateMipmap = sGL.GenerateMipmap;
     sFilterGl.ActiveTexture = sGL.ActiveTexture;
     sFilterGl.BindTexture = sGL.BindTexture;
     sFilterGl.TexParameteri = sGL.TexParameteri;
@@ -879,6 +890,8 @@ void cleanupState(AFMEState& state) {
         if (state.currTex) { sGL.DeleteTextures(1, &state.currTex); state.currTex = 0; }
         if (state.synthTex) { sGL.DeleteTextures(1, &state.synthTex); state.synthTex = 0; }
         if (state.stageTex) { sGL.DeleteTextures(1, &state.stageTex); state.stageTex = 0; }
+        if (state.presentTex) { sGL.DeleteTextures(1, &state.presentTex); state.presentTex = 0; }
+        if (state.genScratchTex) { sGL.DeleteTextures(1, &state.genScratchTex); state.genScratchTex = 0; }
         state.filter.destroy();
         if (state.prevLumaTex) { sGL.DeleteTextures(1, &state.prevLumaTex); state.prevLumaTex = 0; }
         if (state.currLumaTex) { sGL.DeleteTextures(1, &state.currLumaTex); state.currLumaTex = 0; }
@@ -985,6 +998,9 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     const afme::FilterParams fp = afme::filterParams();
     const bool filterOn = afme::filterEnabled() && !fp.isIdentity() &&
                           !state->filter.failed();
+    // Screen-space effects must run AFTER generation on every present, or the
+    // motion field warps them off the screen and the grain is read as motion.
+    bool stageB = filterOn && fp.hasStageB();
 
     if (numGenFrames == 0 && !filterOn) {
         // Nothing to do: the game already fills the panel and no grade is set.
@@ -1014,13 +1030,25 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         if (!state->stageTex) {
             state->stageTex = createTexture(state->width, state->height);
         }
+        if (stageB && !state->presentTex) {
+            state->presentTex = createTexture(state->width, state->height);
+            if (!state->presentTex) stageB = false;
+        }
         initFilterGl();
         if (state->stageTex && state->filter.init(sFilterGl)) {
             captureFramebuffer(*state, state->stageTex);
-            state->filter.apply(state->stageTex, state->currTex,
-                                state->width, state->height, fp);
-            blitTextureToFramebuffer(*state, state->currTex);
+            state->filter.applyStageA(state->stageTex, state->currTex,
+                                      state->width, state->height, fp);
+            if (stageB) {
+                state->filter.applyStageB(state->currTex, state->presentTex,
+                                          state->width, state->height, fp,
+                                          state->frameCount);
+                blitTextureToFramebuffer(*state, state->presentTex);
+            } else {
+                blitTextureToFramebuffer(*state, state->currTex);
+            }
         } else {
+            stageB = false;
             captureFramebuffer(*state, state->currTex);
         }
     } else {
@@ -1096,11 +1124,28 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                                      state->synthTex, factor);
             }
 
+            // Screen-space effects go on the synthetic frame too, or they would
+            // strobe: pinned on real frames, warped away on generated ones.
+            GLuint presentSrc = state->synthTex;
+            if (stageB) {
+                if (!state->genScratchTex) {
+                    state->genScratchTex =
+                            createTexture(state->width, state->height);
+                }
+                if (state->genScratchTex) {
+                    state->filter.applyStageB(
+                            state->synthTex, state->genScratchTex,
+                            state->width, state->height, fp,
+                            (uint64_t)state->frameCount * 8u + (uint64_t)i);
+                    presentSrc = state->genScratchTex;
+                }
+            }
+
             // Blit synthetic frame to backbuffer and present.
             // No glFlush needed here: in the same GLES context, commands are
             // serialized by the GPU. The blit reads completed generation work.
             // eglSwapBuffers does an implicit flush before presenting.
-            blitTextureToFramebuffer(*state, state->synthTex);
+            blitTextureToFramebuffer(*state, presentSrc);
             state->pacer.spaceSynth(i, numGenFrames);
             if (afme::config().pacing.load(std::memory_order_relaxed) &&
                     sGL.PresentationTime && state->pacer.intervalMs() > 0.0f) {
