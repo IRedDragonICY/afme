@@ -1,18 +1,57 @@
 // Copyright (C) 2025-2026 IRedDragonICY
 // SPDX-License-Identifier: Apache-2.0
 //
+// AFME (Adreno Frame Motion Engine) — GPU frame generation, shipped as two
+// platform graphics layers plus the API-agnostic core they share.
+
+cc_defaults {
+    name: "afme_defaults",
+    system_ext_specific: true,
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wno-unused-parameter",
+        "-fvisibility=hidden",
+        "-DLOG_TAG=\"AFME\"",
+    ],
+}
+
+// Scheduling, configuration, statistics and the engagement gate — everything
+// about frame generation that is not graphics.
+//
+// This deliberately has NO EGL/GLES/Vulkan dependency. libAFME_layer resolves
+// GL through eglGetProcAddress and does not link libGLESv3, so shared code that
+// touched GL directly would be an undefined symbol there under
+// -Wl,--no-undefined. Keeping the core graphics-free is what lets one copy of
+// the control law serve both layers.
+cc_library_static {
+    name: "libAFME_core",
+    defaults: ["afme_defaults"],
+
+    srcs: ["afme_core.cpp"],
+
+    shared_libs: [
+        "liblog",
+        "libcutils",
+    ],
+
+    export_include_dirs: ["."],
+}
+
 // AFME (Adreno Frame Motion Engine) EGL Layer
 // Intercepts eglSwapBuffers to inject GPU-accelerated frame extrapolation
 // using Qualcomm's GL_QCOM_frame_extrapolation and GL_QCOM_motion_estimation.
 //
 // All GL functions are resolved dynamically via eglGetProcAddress —
 // the layer only links against libEGL for EGL calls and eglGetProcAddress.
-
 cc_library_shared {
     name: "libAFME_layer",
-    system_ext_specific: true,
+    defaults: ["afme_defaults"],
 
     srcs: ["afme_layer.cpp"],
+
+    static_libs: ["libAFME_core"],
 
     shared_libs: [
         "libEGL",
@@ -25,11 +64,6 @@ cc_library_shared {
     ],
 
     cflags: [
-        "-Wall",
-        "-Werror",
-        "-Wno-unused-parameter",
-        "-fvisibility=hidden",
-        "-DLOG_TAG=\"AFME\"",
         "-DEGL_EGLEXT_PROTOTYPES",
     ],
 
@@ -46,12 +80,13 @@ cc_library_shared {
 // RE'd interface from libVkLayer_ADRENO_qprofiler.so + AOSP loader source
 // File MUST start with "libVkLayer" (DiscoverLayersInPathList filters on that)
 // Layer name: VK_LAYER_AFME_frame_gen (named via setDebugLayers)
-
 cc_library_shared {
     name: "libVkLayer_AFME",
-    system_ext_specific: true,
+    defaults: ["afme_defaults"],
 
     srcs: ["afme_vk_layer.cpp"],
+
+    static_libs: ["libAFME_core"],
 
     shared_libs: [
         "liblog",
@@ -67,11 +102,7 @@ cc_library_shared {
     ],
 
     cflags: [
-        "-Wall",
-        "-Werror",
-        "-Wno-unused-parameter",
         "-Wno-unused-function",
-        "-fvisibility=hidden",
         "-DVK_USE_PLATFORM_ANDROID_KHR",
     ],
 

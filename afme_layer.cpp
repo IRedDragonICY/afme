@@ -66,6 +66,8 @@
 #include <android/log.h>
 #include <cutils/properties.h>
 
+#include "afme_core.h"
+
 // ─── Android EGL Layer types (not in standard EGL headers) ──────────────────
 // Defined by Android's GLES layer loading system.
 // See: frameworks/native/opengl/libs/EGL/GLES_layers.md
@@ -155,12 +157,6 @@ typedef void (*PFNGLSHADINGRATEQCOMPROC)(GLenum);
 
 // EGL_ANDROID_presentation_time: stamp a buffer's latch time
 typedef EGLBoolean (*PFNEGLPRESENTATIONTIMEANDROIDPROC)(EGLDisplay, EGLSurface, EGLnsecsANDROID);
-
-// ─── Frame-generation method ────────────────────────────────────────────────
-enum FGMethod {
-    FG_EXTRAPOLATE = 0,  // glExtrapolateTex2DQCOM — driver black box
-    FG_MOTION      = 1,  // glTexEstimateMotionQCOM + our warp shader
-};
 
 // ─── Layer state ────────────────────────────────────────────────────────────
 namespace {
@@ -315,14 +311,12 @@ struct AFMEState {
     uint32_t frameCount = 0;
     bool extensionsAvailable = false;
 
-    // Frame-interval EMA for the adaptive generation clamp
-    int64_t lastSwapNs = 0;
-    float emaFrameMs = 0.0f;
-
-    // Synthetic-frame spacing (see sSpacingEnabled)
-    int64_t realSwapNs = 0;      // when this frame's real swap was issued
-    float spacingScale = 0.0f;   // 0 = present immediately, 1 = full spacing
-    float bestRealFps = 0.0f;    // reference rate the governor protects
+    // Cadence control law, statistics and the game-loop discriminator. Shared
+    // with the Vulkan layer — see afme_core.h. Per surface, never file-scope:
+    // a surface recreated at a new size must not inherit the old baselines.
+    afme::Pacer pacer;
+    afme::Stats stats;
+    afme::EngagementGate gate;
 
     // ── Motion-estimation resources (method=1 only) ──
     bool motionReady = false;      // ME path fully initialized
@@ -341,139 +335,18 @@ struct AFMEState {
     GLint blockX = 16, blockY = 16;
     bool hasLumaHistory = false;   // prevLumaTex holds a real previous frame
 
-    // ── Stats for the AFME-STATS channel GameSpace parses ──
-    // Per-surface, never file-scope statics: a surface recreated at a new size
-    // must not inherit the old baseline (the Vulkan layer hit exactly that and
-    // reported "real=2147483647 total=-2").
-    int64_t statsBaseNs = 0;
-    uint32_t statsBaseReal = 0;
-    uint32_t statsBaseGen = 0;
-    uint32_t realFrames = 0;
-    uint32_t genFrames = 0;
 };
 
 std::unordered_map<EGLSurface, AFMEState> sStates;
 std::mutex sStateMutex;
 
-std::atomic<bool> sEnabled{false};
-std::atomic<int> sMultiplier{2};
-std::atomic<float> sFactorOverride{0.0f};  // 0 = auto
-std::atomic<int> sDisplayHz{120};          // panel rate from GameStateDispatcher
-std::atomic<int> sMethod{FG_EXTRAPOLATE};
-
-// Synthetic-frame spacing. Swapping the synthetic frame straight after the real
-// one puts it in the very next vsync slot, so a 30fps game on a 120Hz panel
-// shows the real frame for 8ms and the synthetic one for 25ms — 60 presents a
-// second that still read as 30fps with a strobe. Spacing the synthetic swap
-// across the game's frame interval is what actually makes generation visible.
-std::atomic<bool> sSpacingEnabled{true};
-
-// eglPresentationTimeANDROID stamping of synthetic frames. Default OFF: on the
-// bp4a SurfaceFlinger build shipping on onyx, delayed buffers were measured to
-// be DROPPED rather than held (the VK layer's VkPresentTimesInfoGOOGLE path
-// lost >50% of synth frames), so our own spacing sleep is the working
-// mechanism. Kept behind persist.sys.afme.pacing for future SF releases.
-std::atomic<bool> sPacingEnabled{false};
-
-// Apply GL_QCOM_shading_rate to our own full-screen fragment passes (luma,
-// warp). 2x2 VRS quarters the fragment cost of generation; it does NOT touch
-// the game's rendering — we leave 1X1 behind and the driver resets it per
+// Set the fragment shading rate for our passes when supported. Never touches
+// the game's rendering: we leave 1X1 behind and the driver resets it per
 // framebuffer anyway. Compute dispatches are unaffected by VRS.
-std::atomic<bool> sVrsFgEnabled{true};
-
-// Set the fragment shading rate for our passes when supported.
 void setVrsRate(GLenum rate) {
-    if (sGL.ShadingRate && sVrsFgEnabled.load(std::memory_order_relaxed)) {
+    if (sGL.ShadingRate && afme::config().vrsFg.load(std::memory_order_relaxed)) {
         sGL.ShadingRate(rate);
     }
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-void checkProperties() {
-    char value[PROPERTY_VALUE_MAX];
-
-    property_get("persist.sys.afme.enable", value, "0");
-    sEnabled.store(value[0] == '1');
-
-    // Read multiplier (2x, 3x, 4x) — compute factor from this
-    property_get("persist.sys.afme.multiplier", value, "2");
-    int mult = atoi(value);
-    if (mult < 2) mult = 2;
-    if (mult > 4) mult = 4;
-    sMultiplier.store(mult);
-
-    // Frame-generation method. Unknown values fall back to extrapolation,
-    // which needs no shaders and so can never fail to initialize.
-    property_get("persist.sys.afme.method", value, "0");
-    int method = atoi(value);
-    sMethod.store((method == FG_MOTION) ? FG_MOTION : FG_EXTRAPOLATE);
-
-    // User-configurable factor override from GameSpace
-    property_get("persist.sys.afme.factor", value, "");
-    float f = strtof(value, nullptr);
-    sFactorOverride.store((f > 0.0f && f <= 2.0f) ? f : 0.0f);
-
-    // Panel refresh rate — clamp generation so we never queue more frames
-    // than the display can show (BufferQueue back-pressure would throttle
-    // the game itself, e.g. 60fps + 2x on a 60Hz-locked panel → 30fps).
-    property_get("persist.sys.afme.display_hz", value, "120");
-    int hz = atoi(value);
-    if (hz >= 30 && hz <= 240) sDisplayHz.store(hz);
-
-    property_get("persist.sys.afme.spacing", value, "1");
-    sSpacingEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.pacing", value, "0");
-    sPacingEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.vrs_fg", value, "1");
-    sVrsFgEnabled.store(value[0] == '1');
-}
-
-// Hold a synthetic frame until its slot inside the game's frame interval.
-// Scaled by the per-surface governor, so if the sleep costs the game real
-// frames it decays to a no-op by itself.
-void spaceSyntheticFrame(AFMEState& state, int index, int numGenFrames) {
-    if (!sSpacingEnabled.load(std::memory_order_relaxed)) return;
-    if (state.spacingScale <= 0.01f || state.emaFrameMs <= 0.0f) return;
-    if (state.realSwapNs <= 0) return;
-
-    int64_t intervalNs = (int64_t)(state.emaFrameMs * 1e6f);
-    int64_t slotNs = intervalNs / (int64_t)(numGenFrames + 1);
-    int64_t offsetNs = (int64_t)((float)(slotNs * (int64_t)(index + 1))
-                                 * state.spacingScale);
-
-    struct timespec tsNow;
-    clock_gettime(CLOCK_MONOTONIC, &tsNow);
-    int64_t curNs = (int64_t)tsNow.tv_sec * 1000000000LL + tsNow.tv_nsec;
-    int64_t sleepNs = (state.realSwapNs + offsetNs) - curNs;
-
-    // Below ~0.3ms the sleep costs more than it buys; above 50ms the interval
-    // estimate is wrong and we must not hang the game thread on it.
-    if (sleepNs > 300000LL && sleepNs < 50000000LL) {
-        struct timespec req = { (time_t)(sleepNs / 1000000000LL),
-                                (long)(sleepNs % 1000000000LL) };
-        nanosleep(&req, nullptr);
-    }
-}
-
-// Regulate the spacing scale on the real frame rate — the quantity spacing
-// must not damage. Free when the game is capped below the panel (its own
-// limiter just sleeps less); costly when it is work-bound. A single interval
-// measurement cannot tell those apart, so let the loop find out.
-void updateSpacingGovernor(AFMEState& state) {
-    if (state.emaFrameMs <= 0.0f) return;
-    float realFps = 1000.0f / state.emaFrameMs;
-    state.bestRealFps = (realFps > state.bestRealFps)
-                            ? realFps : state.bestRealFps * 0.999f;
-    if (state.bestRealFps > 1.0f && realFps < state.bestRealFps * 0.94f) {
-        state.spacingScale -= 0.08f;   // back off fast: we are costing frames
-    } else {
-        state.spacingScale += 0.02f;   // creep up: 50 frames to full
-    }
-    if (state.spacingScale < 0.0f) state.spacingScale = 0.0f;
-    if (state.spacingScale > 1.0f) state.spacingScale = 1.0f;
 }
 
 void resolveGLFunctions() {
@@ -979,34 +852,6 @@ void cleanupState(AFMEState& state) {
     state.hasLumaHistory = false;
 }
 
-// Publish real/generated FPS once per second.
-//
-// property_set() from a game process can never work — platform sepolicy has
-// `neverallow all_untrusted_apps property_type:property_service set` — so the
-// overlay reads these log lines instead. GameSpace (system_app, READ_LOGS)
-// greps "AFME-STATS real=N gen=N total=N" off logcat at AFME:I.
-void publishStats(AFMEState& state, int64_t nowNs) {
-    if (state.statsBaseNs == 0) {
-        state.statsBaseNs = nowNs;
-        state.statsBaseReal = state.realFrames;
-        state.statsBaseGen = state.genFrames;
-        return;
-    }
-    double elapsed = (double)(nowNs - state.statsBaseNs) / 1e9;
-    if (elapsed < 1.0) return;
-
-    uint32_t realDelta = state.realFrames - state.statsBaseReal;
-    uint32_t genDelta = state.genFrames - state.statsBaseGen;
-    int realFps = (int)((double)realDelta / elapsed + 0.5);
-    int genFps = (int)((double)genDelta / elapsed + 0.5);
-
-    ALOGI("AFME-STATS real=%d gen=%d total=%d", realFps, genFps, realFps + genFps);
-
-    state.statsBaseNs = nowNs;
-    state.statsBaseReal = state.realFrames;
-    state.statsBaseGen = state.genFrames;
-}
-
 // ─── Hooked EGL functions ───────────────────────────────────────────────────
 
 EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
@@ -1019,13 +864,12 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     typedef EGLBoolean (*PFNEGLSWAPBUFFERSPROC)(EGLDisplay, EGLSurface);
     auto nextSwap = reinterpret_cast<PFNEGLSWAPBUFFERSPROC>(realSwap);
 
-    // Check every 64 frames
-    static uint32_t sCheckCounter = 0;
-    if ((sCheckCounter++ & 0x3F) == 0) {
-        checkProperties();
+    static uint64_t sPresentCount = 0;
+    if ((sPresentCount++ % afme::kPollInterval) == 0) {
+        afme::config().poll();
     }
 
-    if (!sEnabled.load(std::memory_order_relaxed)) {
+    if (!afme::config().enabled.load(std::memory_order_relaxed)) {
         return nextSwap(dpy, surface);
     }
 
@@ -1056,48 +900,37 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     // ═══ AFME Frame Generation Pipeline ═══
 
-    // Adaptive generation clamp: measure the game's swap interval and never
-    // queue more frames than the panel has vsync slots for. Without this,
-    // BufferQueue back-pressure throttles the game itself (60fps + 2x on a
-    // 60Hz-locked panel → 30fps real).
-    struct timespec tsNow;
-    clock_gettime(CLOCK_MONOTONIC, &tsNow);
-    int64_t nowNs = (int64_t)tsNow.tv_sec * 1000000000LL + tsNow.tv_nsec;
-    if (state->lastSwapNs > 0) {
-        float ms = (float)(nowNs - state->lastSwapNs) / 1e6f;
-        if (ms > 0.05f && ms < 200.0f) {
-            state->emaFrameMs = (state->emaFrameMs <= 0.0f)
-                                    ? ms : state->emaFrameMs * 0.9f + ms * 0.1f;
-        }
+    const int64_t nowNs = afme::nowNs();
+
+    // Is this surface a game render loop, or the Activity's HWUI window behind
+    // a SurfaceView game? Both layers are armed for the package because which
+    // graphics API a game presents with is not knowable before it runs, so this
+    // layer does get loaded into Vulkan games — where accelerating the only EGL
+    // surface in the process would be pure waste.
+    if (!state->gate.check(nowNs, state->width, state->height)) {
+        return nextSwap(dpy, surface);
     }
-    state->lastSwapNs = nowNs;
-    updateSpacingGovernor(*state);
 
     // Every swap the game makes is a real frame, whether or not we end up
     // generating from it. Counting it only on the generating path would report
     // real=0 for the whole time the panel has no headroom.
-    state->realFrames++;
+    state->stats.addReal();
 
-    int mult = sMultiplier.load(std::memory_order_relaxed);
-    int numGenFrames = mult - 1;  // 2x→1, 3x→2, 4x→3
-    if (state->emaFrameMs > 0.0f) {
-        float gameFps = 1000.0f / state->emaFrameMs;
-        int slots = (int)(((float)sDisplayHz.load(std::memory_order_relaxed)
-                           * 1.02f) / gameFps);
-        int maxGen = slots - 1;
-        if (maxGen < 0) maxGen = 0;
-        if (numGenFrames > maxGen) numGenFrames = maxGen;
-    }
+    const int mult = afme::config().multiplier.load(std::memory_order_relaxed);
+    const int hz = afme::config().displayHz.load(std::memory_order_relaxed);
+    const afme::Pacer::Tier tier = state->pacer.beginPresent(nowNs, mult, hz);
+    const int numGenFrames = tier.numGen;
 
     if (numGenFrames == 0) {
-        // No panel headroom: stay out of the way entirely.
+        // The game already fills the panel by itself: stay out of the way.
         state->hasPrevFrame = false;
         state->hasLumaHistory = false;
-        publishStats(*state, nowNs);
+        state->pacer.abortPresent(nowNs);
+        state->stats.publish(nowNs);
         return nextSwap(dpy, surface);
     }
 
-    const int method = sMethod.load(std::memory_order_relaxed);
+    const int method = afme::config().method.load(std::memory_order_relaxed);
 
     // Everything below rewrites GL state the game owns. Save it once here and
     // restore it once before handing control back: the game cannot issue a draw
@@ -1112,7 +945,7 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // for. If it cannot be built we degrade to extrapolation rather than
     // dropping frame generation altogether.
     bool useMotion = false;
-    if (method == FG_MOTION) {
+    if (method == afme::kMotion) {
         if (!state->motionReady && !state->motionAttempted) {
             initMotionEstimation(*state);
         }
@@ -1139,19 +972,16 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         guard.restore();
         return result;
     }
-    {
-        // Anchor for spacing the synthetic frames that follow.
-        struct timespec tsReal;
-        clock_gettime(CLOCK_MONOTONIC, &tsReal);
-        state->realSwapNs = (int64_t)tsReal.tv_sec * 1000000000LL + tsReal.tv_nsec;
-    }
+    // Anchor for spacing the synthetic frames that follow.
+    state->pacer.anchorReal(afme::nowNs());
 
     // Step 4: If we have a previous frame, synthesize and present.
     // The motion path additionally needs a luma history to have an MV field.
     const bool canGenerate = state->hasPrevFrame &&
                              (!useMotion || state->hasLumaHistory);
     if (canGenerate) {
-        float userFactor = sFactorOverride.load(std::memory_order_relaxed);  // 0 = auto
+        const float userFactor =
+                afme::config().factorOverride.load(std::memory_order_relaxed);
 
         for (int i = 0; i < numGenFrames; i++) {
             // Phase within the interval is (i+1)/(numGenFrames+1) of the
@@ -1176,22 +1006,19 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
             // serialized by the GPU. The blit reads completed generation work.
             // eglSwapBuffers does an implicit flush before presenting.
             blitTextureToFramebuffer(*state, state->synthTex);
-            spaceSyntheticFrame(*state, i, numGenFrames);
-            if (sPacingEnabled.load(std::memory_order_relaxed) &&
-                    sGL.PresentationTime && state->emaFrameMs > 0.0f) {
+            state->pacer.spaceSynth(i, numGenFrames);
+            if (afme::config().pacing.load(std::memory_order_relaxed) &&
+                    sGL.PresentationTime && state->pacer.intervalMs() > 0.0f) {
                 // Ask SurfaceFlinger to latch THIS buffer at its temporal
                 // slot rather than the next vsync (standard presentation-time placement).
-                struct timespec tsP;
-                clock_gettime(CLOCK_MONOTONIC, &tsP);
-                int64_t nowPn = (int64_t)tsP.tv_sec * 1000000000LL + tsP.tv_nsec;
-                int64_t offsetNs = (int64_t)(state->emaFrameMs * 1e6f *
+                int64_t offsetNs = (int64_t)(state->pacer.intervalMs() * 1e6f *
                                              (float)(i + 1) / (float)(numGenFrames + 1))
                                    - 3000000LL;
                 if (offsetNs < 0) offsetNs = 0;
-                sGL.PresentationTime(dpy, surface, nowPn + offsetNs);
+                sGL.PresentationTime(dpy, surface, afme::nowNs() + offsetNs);
             }
             result = nextSwap(dpy, surface);
-            state->genFrames++;
+            state->stats.addGen();
         }
     }
 
@@ -1210,14 +1037,29 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     }
 
     state->frameCount++;
-    publishStats(*state, nowNs);
+
+    const int64_t endNs = afme::nowNs();
+    state->stats.publish(endNs);
 
     if ((state->frameCount % 300) == 0) {
-        ALOGI("AFME: %u frames generated (%dx mode, method=%s) [%dx%d]",
-              state->frameCount, sMultiplier.load(),
+        ALOGI("AFME: %u frames generated (%dx mode, %d gen/frame, method=%s) "
+              "[%dx%d]",
+              state->frameCount, mult, numGenFrames,
               useMotion ? "motion" : "extrapolate",
               state->width, state->height);
     }
+
+    // Lock the game to (numGen+1) vsync slots so total presents fill every
+    // slot. Without this the base rate floats, and a base that straddles a tier
+    // boundary flips the display cadence every few seconds — which is exactly
+    // the stutter the Vulkan layer was fixed for in v6. This layer had no
+    // limiter at all until the control law became shared.
+    //
+    // Uses the staged panel rate: unlike the Vulkan layer there is no measured
+    // refresh cycle here yet (eglGetCompositorTimingANDROID would be the
+    // equivalent and is the obvious follow-up).
+    const int64_t vsyncNs = 1000000000LL / (int64_t)(hz > 0 ? hz : 60);
+    state->pacer.endPresent(endNs, numGenFrames, tier.paceable, vsyncNs);
 
     return result;
 }
@@ -1251,7 +1093,7 @@ EGLBoolean EGLAPIENTRY afme_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
     typedef EGLBoolean (*PFNEGLSWAPINTERVAL)(EGLDisplay, EGLint);
     auto next = reinterpret_cast<PFNEGLSWAPINTERVAL>(realSwapInterval);
 
-    if (sEnabled.load(std::memory_order_relaxed) && interval > 0) {
+    if (afme::config().enabled.load(std::memory_order_relaxed) && interval > 0) {
         ALOGD("AFME: Overriding swap interval %d -> 0 for frame gen", interval);
         return next(dpy, 0);
     }
@@ -1277,9 +1119,10 @@ void glesLayer_InitializeLayer(
         PFNEGLGETNEXTLAYERPROCADDRESSPROC get_next_layer_proc_address) {
     sLayerId = layer_id;
     sGetNextLayerProcAddress = get_next_layer_proc_address;
-    checkProperties();
+    afme::config().poll();
     ALOGI("AFME: Layer initialized (enabled=%d multiplier=%d method=%d)",
-          sEnabled.load(), sMultiplier.load(), sMethod.load());
+          afme::config().enabled.load(), afme::config().multiplier.load(),
+          afme::config().method.load());
 }
 
 EGLFuncPointer glesLayer_GetLayerProcAddress(

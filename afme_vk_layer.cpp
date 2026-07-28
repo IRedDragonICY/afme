@@ -48,6 +48,8 @@
 #include <android/log.h>
 #include <cutils/properties.h>
 
+#include "afme_core.h"
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 #define LOG_TAG "AFME"
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -60,14 +62,13 @@ static const char kLayerDescription[] = "AFME Frame Generation Layer (IRedDragon
 static const uint32_t kLayerImplVersion = 5;
 static const uint32_t kLayerSpecVersion = VK_MAKE_API_VERSION(0, 1, 3, 0);
 
-static constexpr int kMaxMultiplier = 4;
 
 // Maximum pre-allocated semaphores for frame generation (per swapchain)
 // Each synth frame needs 2 sems (acquire + signal); deferred drain means up to
 // 2 frames of sems may be in-flight simultaneously. 4x * 4 = 16 covers worst case.
-static constexpr int kMaxSemaphorePool = kMaxMultiplier * 4;
+static constexpr int kMaxSemaphorePool = afme::kMaxMultiplier * 4;
 // Pre-allocated command buffer ring (avoid hot-path alloc/free)
-static constexpr int kCmdRingSize = kMaxMultiplier * 2 + 2;  // +2 for copy steps
+static constexpr int kCmdRingSize = afme::kMaxMultiplier * 2 + 2;  // +2 for copy steps
 
 typedef void (GL_APIENTRYP PFNGLEXTRAPOLATETEX2DQCOMPROC)(GLuint, GLuint, GLuint, float);
 typedef void (GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum, void*);
@@ -149,69 +150,6 @@ PFN_vkGetRefreshCycleDurationGOOGLE next_vkGetRefreshCycleDurationGOOGLE{};
 
 // ─── Global State ───────────────────────────────────────────────────────────
 
-std::atomic<bool> gEnabled{false};
-std::atomic<int> gMultiplier{2};  // 2x, 3x, 4x
-std::atomic<float> gFactorOverride{0.0f};  // 0 = auto (compute from multiplier)
-std::atomic<int> gSgsrMode{0};    // 0=off, 1=SGSR1, 2=SGSR2, 3=MobFGSR (legacy)
-
-// Frame-generation method — which primitive synthesizes the frame. Kept
-// separate from gSgsrMode, which selects *upscaling/sharpening* and is an
-// orthogonal choice: you can sharpen either method's output.
-//   FG_EXTRAPOLATE  glExtrapolateTex2DQCOM — driver black box, one call.
-//   FG_MOTION       glTexEstimateMotionQCOM + MobFGSR reproject/warp.
-enum FGMethod {
-    FG_EXTRAPOLATE = 0,
-    FG_MOTION      = 1,
-};
-std::atomic<int> gMethod{FG_EXTRAPOLATE};
-
-// True when the motion-estimation pipeline should be built/used. sgsr.mode==3
-// is the legacy spelling of the same request and stays honoured so existing
-// per-game configs keep working.
-static inline bool wantMotionMethod() {
-    return gMethod.load() == FG_MOTION || gSgsrMode.load() == 3;
-}
-std::atomic<bool> gSmoothMotion{true};
-std::atomic<int> gDisplayHz{120}; // panel rate published by GameStateDispatcher
-// Apply GL_QCOM_shading_rate to our own full-screen fragment passes (SGSR1
-// sharpen, MobFGSR luma conversion). 2x2 VRS quarters fragment cost of frame
-// generation; compute dispatches are unaffected by VRS. Never touches the
-// game's rendering (our passes run on the hidden EGL context).
-std::atomic<bool> gVrsFgEnabled{true};
-// HUD ghost protection: accumulate a screen-static region mask per ME block
-// and pin those pixels to the current real frame in the warp (kills the
-// classic FG "shadow trail" on minimap/bars/buttons).
-std::atomic<bool> gHudMaskEnabled{true};
-// Anti-ghost for MOVING content (v8): deep-occlusion holes anchor to the
-// real current pixel instead of blending two MV-guessed samples, and any
-// high-disagreement blend damps toward the temporally closer sample — the
-// two mechanisms behind character-silhouette "shadow trails" (most visible
-// on the running character at screen center while panning the camera).
-std::atomic<bool> gAntiGhostEnabled{true};
-// desiredPresentTime pacing (VK_GOOGLE_display_timing). Default OFF: measured
-// on onyx (SF version bp4a) that SurfaceFlinger drops >50% of the delayed
-// synth buffers (droppedFrames 0→230/648) instead of holding them, making
-// cadence worse. Kept behind persist.sys.afme.pacing for future tuning.
-std::atomic<bool> gPacingEnabled{false};
-// Swappy-style frame limiter: pace the game to exactly (numGen+1) vsync
-// slots so total presents fill every slot (40fps × 3 = 120Hz). A stable
-// base matters more than a high one for frame generation — measured on ZZZ
-// city (36-43fps): without this, the base straddles the clamp boundary at
-// 40.8fps and the cadence flips 120↔86 total every few seconds (stutter).
-std::atomic<bool> gLimiterEnabled{true};
-// Synthetic-frame spacing. Presenting the synth frame straight after the real
-// one puts it in the very next vsync slot, so at a 30fps game on a 120Hz panel
-// the real frame is visible for 8ms and the synthetic one for 25ms (measured
-// present2present: 8ms×856, 24ms×594). That is 60 presents/second that still
-// read as 30fps with a strobe. Spacing them across the game's frame interval
-// is what actually makes generation visible.
-//
-// This is NOT the same mechanism as gPacingEnabled above: that one asks
-// SurfaceFlinger to hold a buffer via desiredPresentTime and SF drops it
-// instead. This one delays our own vkQueuePresentKHR call, which SF cannot
-// second-guess.
-std::atomic<bool> gSpacingEnabled{true};
-std::atomic<uint64_t> gFrameCount{0};
 std::mutex gLock;
 
 // ─── SGSR1 Shader Sources (Qualcomm BSD-3) ──────────────────────────────────
@@ -337,66 +275,6 @@ bool initDeviceFunc(VkDevice device, const char* name, T* func) {
     return true;
 }
 
-void checkProperties() {
-    char value[PROPERTY_VALUE_MAX];
-    property_get("persist.sys.afme.enable", value, "0");
-    gEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.multiplier", value, "2");
-    int m = atoi(value);
-    if (m >= 2 && m <= kMaxMultiplier) gMultiplier.store(m);
-
-    // User-configurable factor override from GameSpace
-    // Empty or "auto" → 0.0 (auto-compute from multiplier)
-    property_get("persist.sys.afme.factor", value, "");
-    float f = strtof(value, nullptr);
-    if (f > 0.0f && f <= 2.0f) {
-        gFactorOverride.store(f);
-    } else {
-        gFactorOverride.store(0.0f);
-    }
-
-    // SGSR Super Resolution mode
-    property_get("persist.sys.sgsr.mode", value, "0");
-    int sgsr = atoi(value);
-    if (sgsr >= 0 && sgsr <= 3) gSgsrMode.store(sgsr);  // 0=off, 1=SGSR1, 2=SGSR2, 3=MobFGSR
-
-    // Frame-generation method. Anything unrecognised means extrapolation, which
-    // needs no shaders and so can never fail to initialize.
-    property_get("persist.sys.afme.method", value, "0");
-    int method = atoi(value);
-    gMethod.store((method == FG_MOTION) ? FG_MOTION : FG_EXTRAPOLATE);
-
-    // Smooth Motion (set by GameStateDispatcher via persist.sys.* namespace)
-    property_get("persist.sys.afme.smooth_motion", value, "1");
-    gSmoothMotion.store(value[0] == '1');
-
-    // Panel refresh rate — used to clamp the generation ratio so we never
-    // queue more presents than the display can show (FIFO back-pressure
-    // would throttle the game itself, e.g. 60fps + 2x on a 60Hz panel → 30fps)
-    property_get("persist.sys.afme.display_hz", value, "120");
-    int hz = atoi(value);
-    if (hz >= 30 && hz <= 240) gDisplayHz.store(hz);
-
-    property_get("persist.sys.afme.pacing", value, "0");
-    gPacingEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.limiter", value, "1");
-    gLimiterEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.spacing", value, "1");
-    gSpacingEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.vrs_fg", value, "1");
-    gVrsFgEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.hud_mask", value, "1");
-    gHudMaskEnabled.store(value[0] == '1');
-
-    property_get("persist.sys.afme.anti_ghost", value, "1");
-    gAntiGhostEnabled.store(value[0] == '1');
-}
-
 static uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& memProps,
                                 uint32_t typeFilter, VkMemoryPropertyFlags flags) {
     for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
@@ -464,38 +342,14 @@ struct AFMEContext {
     VkFence drainFence = VK_NULL_HANDLE;
     bool drainPending = false;
 
-    // Frame-interval EMA for the adaptive generation-ratio clamp
-    int64_t lastPresentNs = 0;
-    float emaFrameMs = 0.0f;
-
-    // Generation-count hysteresis + frame-limiter state
-    int stableGen = -1;          // committed synth count (-1 = uninitialized)
-    int genUpCounter = 0;        // frames the tier wanted MORE gen
-    int genDownCounter = 0;      // frames the tier wanted FEWER gen
-    int64_t nextDeadlineNs = 0;  // limiter pacing deadline
-    bool paceable = false;       // chosen tier's base rate is sustainable
-
-    // Capability estimation: WORK time per frame = interval minus our own
-    // pacing sleep. Unlike the raw frame interval, this stays valid while
-    // the limiter is engaged, breaking the pacing↔measurement feedback loop.
-    float emaWorkMs = 0.0f;
-    int64_t lastReturnNs = 0;    // when the previous present returned to game
-
-    // Per-context FPS stats baseline (statics corrupt across swapchains)
-    int64_t statsBaseNs = 0;
-    uint64_t statsBaseReal = 0;
-    uint64_t statsBaseGen = 0;
-
-    // Engagement gate: is this swapchain a game render loop, or a UI window?
-    bool engaged = false;
-    int engageRun = 0;
-    int64_t engageLastNs = 0;
-    float engageEmaMs = 0.0f;
-
-    // Synthetic-frame spacing
-    int64_t realPresentNs = 0;   // when this frame's real present was issued
-    float spacingScale = 0.0f;   // 0 = present immediately, 1 = full spacing
-    float bestRealFps = 0.0f;    // reference rate the governor protects
+    // Cadence control law, statistics and the game-loop discriminator. Shared
+    // with the GLES layer — see afme_core.h. Per context, never file-scope:
+    // games recreate swapchains (ZZZ makes several at startup) and a static
+    // baseline from the old one underflows against the new context's small
+    // counters (observed: "real=2147483647 total=-2" for one window).
+    afme::Pacer pacer;
+    afme::Stats stats;
+    afme::EngagementGate gate;
 
     // MobFGSR is built at swapchain creation, but the method property can flip
     // mid-session; this lets us build it on first use without retrying forever.
@@ -505,7 +359,7 @@ struct AFMEContext {
     bool hasDisplayTiming = false;
     uint32_t presentId = 0;
     // Measured panel refresh cycle (vkGetRefreshCycleDurationGOOGLE); 0 = use
-    // the gDisplayHz prop instead. Vsync grid
+    // the afme::config().displayHz prop instead. Vsync grid
     // calibration: the panel CAN differ from the staged prop (e.g. Battery
     // Saver votes 60Hz over the GameStateDispatcher force), and tier/limiter
     // math against the wrong grid produced exactly the invisible-generation
@@ -526,7 +380,7 @@ struct AFMEContext {
     // AHB frames for AFME
     AHBImage prevFrame;
     AHBImage currFrame;
-    AHBImage synthFrames[kMaxMultiplier - 1]; // up to 3 for 4x
+    AHBImage synthFrames[afme::kMaxMultiplier - 1]; // up to 3 for 4x
 
     // EGL/GLES context (owned by this swapchain context)
     EGLDisplay eglDpy = EGL_NO_DISPLAY;
@@ -620,12 +474,12 @@ static inline int effectiveHz(const AFMEContext& ctx) {
         int hz = (int)(1000000000.0 / (double)ctx.refreshCycleNs + 0.5);
         if (hz >= 10 && hz <= 500) return hz;
     }
-    return gDisplayHz.load(std::memory_order_relaxed);
+    return afme::config().displayHz.load(std::memory_order_relaxed);
 }
 
 // Set fragment shading rate for our passes when the driver supports it.
 static inline void setFgShadingRate(const AFMEContext& ctx, GLenum rate) {
-    if (ctx.glShadingRate && gVrsFgEnabled.load(std::memory_order_relaxed)) {
+    if (ctx.glShadingRate && afme::config().vrsFg.load(std::memory_order_relaxed)) {
         ctx.glShadingRate(rate);
     }
 }
@@ -1491,11 +1345,11 @@ static void applyMobFGSRWarp(AFMEContext& ctx, float delta) {
     glUniform1f(glGetUniformLocation(ctx.warpProg, "depthThreshold"), 0.004f);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "colorThreshold"), 0.01f);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "hudStrength"),
-                gHudMaskEnabled.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
+                afme::config().hudMask.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "holeAnchor"),
-                gAntiGhostEnabled.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
+                afme::config().antiGhost.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "ghostStrength"),
-                gAntiGhostEnabled.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
+                afme::config().antiGhost.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
     glDispatchCompute(gx, gy, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 }
@@ -1813,7 +1667,7 @@ static bool initAFMEContext(AFMEContext& ctx) {
     if (!createAHBImage(ctx, ctx.prevFrame, w, h)) return false;
     if (!createAHBImage(ctx, ctx.currFrame, w, h)) return false;
 
-    int mult = gMultiplier.load();
+    int mult = afme::config().multiplier.load();
     ctx.allocatedMult = mult;  // Track what we actually allocated
     for (int i = 0; i < mult - 1; i++) {
         if (!createAHBImage(ctx, ctx.synthFrames[i], w, h)) {
@@ -1833,7 +1687,7 @@ static bool initAFMEContext(AFMEContext& ctx) {
         eglMakeCurrent(ctx.eglDpy, ctx.eglSurf, ctx.eglSurf, ctx.eglCtx);
 
         // SGSR1: adaptive sharpening
-        if (gSgsrMode.load() >= 1) {
+        if (afme::config().sgsrMode.load() >= 1) {
             if (initSGSR(ctx)) {
                 // Create sharpened frame buffer for SGSR1 output
                 // (uses createGLTex since it's GLES-only, not AHB)
@@ -1844,7 +1698,7 @@ static bool initAFMEContext(AFMEContext& ctx) {
         }
 
         // MobFGSR: motion-vector based interpolation (method=1)
-        if (wantMotionMethod()) {
+        if (afme::config().wantMotion()) {
             ctx.mobfgsrAttempted = true;
             initMobFGSR(ctx);
         }
@@ -1867,7 +1721,7 @@ static bool initAFMEContext(AFMEContext& ctx) {
             ctx.refreshCycleNs = dur.refreshDuration;
             ALOGI("AFME: Measured panel refresh cycle %llu ns (~%d Hz, prop Hz=%d)",
                   (unsigned long long)ctx.refreshCycleNs, effectiveHz(ctx),
-                  gDisplayHz.load());
+                  afme::config().displayHz.load());
         }
     }
 
@@ -1878,56 +1732,6 @@ static bool initAFMEContext(AFMEContext& ctx) {
           ctx.mobfgsrInitialized ? 1 : 0, ctx.hasNativeFenceSync ? 1 : 0,
           ctx.hasDisplayTiming ? 1 : 0);
     return true;
-}
-
-// ─── Engagement gate ────────────────────────────────────────────────────────
-//
-// Both AFME layers are armed for the target package, because which graphics API
-// a game actually presents with is not knowable before it runs. So this layer
-// gets loaded even into GLES games — and there the only Vulkan swapchain in the
-// process belongs to HWUI, drawing the Activity's view hierarchy behind the
-// game's SurfaceView. Accelerating that would be pure waste: GPU time spent
-// generating duplicates of a near-static window, extra presents on it, and a
-// second context reporting into the AFME-STATS channel the overlay reads.
-//
-// The discriminator is behavioural: a game render loop presents continuously,
-// a UI window presents only when something changes. Requiring a sustained
-// present interval under kEngageMaxIntervalMs across kEngageRunFrames separates
-// them without needing to recognise engines. Thread identity would be the
-// obvious alternative and is NOT usable — Unreal Engine also names its render
-// thread "RenderThread", exactly like HWUI.
-//
-// A loading screen presenting slowly just delays engagement, which is the
-// behaviour we want anyway. Residual exposure: a long, smooth animation in the
-// game's own Activity window could engage it; for a fullscreen SurfaceView game
-// that window is static, so this has not been observed.
-static constexpr float kEngageMaxIntervalMs = 50.0f;  // 20fps floor
-static constexpr int   kEngageRunFrames = 24;
-
-static bool engagementCheck(AFMEContext& ctx, int64_t nowNs) {
-    if (ctx.engaged) return true;
-
-    if (ctx.engageLastNs > 0) {
-        float ms = (float)(nowNs - ctx.engageLastNs) / 1e6f;
-        if (ms > 0.05f && ms < kEngageMaxIntervalMs) {
-            ctx.engageRun++;
-            ctx.engageEmaMs = (ctx.engageEmaMs <= 0.0f)
-                                  ? ms : ctx.engageEmaMs * 0.8f + ms * 0.2f;
-        } else {
-            ctx.engageRun = 0;
-            ctx.engageEmaMs = 0.0f;
-        }
-    }
-    ctx.engageLastNs = nowNs;
-
-    if (ctx.engageRun >= kEngageRunFrames) {
-        ctx.engaged = true;
-        ALOGI("AFME: engaged on %ux%u swapchain (%.1ffps sustained over %d frames)",
-              ctx.extent.width, ctx.extent.height,
-              ctx.engageEmaMs > 0.0f ? 1000.0f / ctx.engageEmaMs : 0.0f,
-              ctx.engageRun);
-    }
-    return ctx.engaged;
 }
 
 // ─── Vulkan Hooks ───────────────────────────────────────────────────────────
@@ -1965,9 +1769,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateInstance(
     initInstanceFunc(*pInstance, "vkEnumerateDeviceExtensionProperties",
                      &next_vkEnumerateDeviceExtensionProperties);
 
-    checkProperties();
+    afme::config().poll();
     ALOGI("AFME VK Layer v8: Instance created (enabled=%d multiplier=%dx)",
-          gEnabled.load(), gMultiplier.load());
+          afme::config().enabled.load(), afme::config().multiplier.load());
     return VK_SUCCESS;
 }
 
@@ -2151,13 +1955,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateSwapchainKHR(
         const VkSwapchainCreateInfoKHR* pCreateInfo,
         const VkAllocationCallbacks* pAllocator,
         VkSwapchainKHR* pSwapchain) {
-    if (!next_vkCreateSwapchainKHR || !gEnabled.load(std::memory_order_relaxed)) {
+    if (!next_vkCreateSwapchainKHR || !afme::config().enabled.load(std::memory_order_relaxed)) {
         return next_vkCreateSwapchainKHR ?
             next_vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain) :
             VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    int mult = gMultiplier.load();
+    int mult = afme::config().multiplier.load();
 
     // Modify swapchain: increase image count + add TRANSFER usage for blit ops
     VkSwapchainCreateInfoKHR modifiedInfo = *pCreateInfo;
@@ -2188,7 +1992,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateSwapchainKHR(
     // buffer before latch, so synthetic frames would be discarded while the
     // stats still count them (bug E from the 2026-07-28 analysis — generation
     // "working" invisibly). FIFO keeps every present a definite vsync occupant.
-    if (gEnabled.load(std::memory_order_relaxed) &&
+    if (afme::config().enabled.load(std::memory_order_relaxed) &&
         modifiedInfo.presentMode != VK_PRESENT_MODE_FIFO_KHR) {
         ALOGI("AFME: Forcing presentMode FIFO (was %d) — synth frames need "
               "reliable vsync latching", (int)pCreateInfo->presentMode);
@@ -2273,10 +2077,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     if (!next_vkQueuePresentKHR) return VK_ERROR_DEVICE_LOST;
 
-    uint64_t fc = gFrameCount.fetch_add(1);
-    if ((fc & 0x3F) == 0) checkProperties();
+    static std::atomic<uint64_t> sPresentCount{0};
+    const uint64_t fc = sPresentCount.fetch_add(1);
+    if ((fc % afme::kPollInterval) == 0) afme::config().poll();
 
-    if (!gEnabled.load(std::memory_order_relaxed)) {
+    if (!afme::config().enabled.load(std::memory_order_relaxed)) {
         return next_vkQueuePresentKHR(queue, pPresentInfo);
     }
 
@@ -2287,7 +2092,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
     VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
     uint32_t presentIdx = pPresentInfo->pImageIndices[0];
-    int mult = gMultiplier.load();
+    int mult = afme::config().multiplier.load();
 
     AFMEContext* ctxPtr = nullptr;
     {
@@ -2305,13 +2110,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     // ── Engagement gate ─────────────────────────────────────────────────
     // Runs before the lazy resource init below, so a swapchain we never
     // accelerate costs nothing but this counter.
-    {
-        struct timespec tsGate;
-        clock_gettime(CLOCK_MONOTONIC, &tsGate);
-        int64_t gateNs = (int64_t)tsGate.tv_sec * 1000000000LL + tsGate.tv_nsec;
-        if (!engagementCheck(ctx, gateNs)) {
-            return next_vkQueuePresentKHR(queue, pPresentInfo);
-        }
+    if (!ctx.gate.check(afme::nowNs(), (int)ctx.extent.width,
+                        (int)ctx.extent.height)) {
+        return next_vkQueuePresentKHR(queue, pPresentInfo);
     }
 
     // Dynamic synth frame reallocation: if user increased multiplier
@@ -2415,159 +2216,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         ctx.drainPending = false;
     }
 
-    // Frame-interval EMA + capability (work-time) EMA
-    struct timespec tsNow;
-    clock_gettime(CLOCK_MONOTONIC, &tsNow);
-    int64_t nowNs = (int64_t)tsNow.tv_sec * 1000000000LL + tsNow.tv_nsec;
-    if (ctx.lastPresentNs > 0) {
-        float ms = (float)(nowNs - ctx.lastPresentNs) / 1e6f;
-        if (ms > 0.05f && ms < 200.0f) {
-            ctx.emaFrameMs = (ctx.emaFrameMs <= 0.0f)
-                                 ? ms : ctx.emaFrameMs * 0.9f + ms * 0.1f;
-        }
-    }
-    ctx.lastPresentNs = nowNs;
+    const int64_t nowNs = afme::nowNs();
+    const afme::Pacer::Tier tier =
+            ctx.pacer.beginPresent(nowNs, mult, effectiveHz(ctx));
+    const int numGenFrames = tier.numGen;
 
-    // ── Spacing governor ─────────────────────────────────────────────
-    // A spacing sleep takes wall-clock time from the game thread. That is
-    // free when the game is capped below the panel — the usual frame-gen
-    // case, where its own limiter simply sleeps less — and expensive when
-    // the game is work-bound, where it directly costs real frames. Both
-    // look identical in any single measurement (a 30fps cap and a 30fps
-    // GPU limit have the same frame interval), so instead of trying to
-    // classify, regulate on the quantity we must not damage: the real
-    // frame rate. If spacing is free the scale walks to 1; the moment it
-    // starts costing frames it retreats.
-    if (ctx.emaFrameMs > 0.0f) {
-        float realFps = 1000.0f / ctx.emaFrameMs;
-        // Decay the reference so a genuine scene-complexity drop
-        // re-baselines instead of pinning the scale at zero forever.
-        ctx.bestRealFps = (realFps > ctx.bestRealFps)
-                              ? realFps : ctx.bestRealFps * 0.999f;
-        if (ctx.bestRealFps > 1.0f && realFps < ctx.bestRealFps * 0.94f) {
-            ctx.spacingScale -= 0.08f;   // back off fast: we are costing frames
-        } else {
-            ctx.spacingScale += 0.02f;   // creep up: 50 frames to full
-        }
-        if (ctx.spacingScale < 0.0f) ctx.spacingScale = 0.0f;
-        if (ctx.spacingScale > 1.0f) ctx.spacingScale = 1.0f;
-    }
-
-    // Capability: how fast the game could run if we never slept it.
-    // work = time since the previous present RETURNED (i.e. excludes our
-    // limiter sleep). This is what the tier choice must be based on —
-    // basing it on the raw interval creates a dead zone (measured on ZZZ
-    // city, 39-45fps free-run at 120Hz: too fast for the ≤40.8fps 2-synth
-    // clamp, too slow for 1 synth to fill the panel → 86 uneven presents).
-    if (ctx.lastReturnNs > 0) {
-        float workMs = (float)(nowNs - ctx.lastReturnNs) / 1e6f;
-        if (workMs > 0.05f && workMs < 200.0f) {
-            ctx.emaWorkMs = (ctx.emaWorkMs <= 0.0f)
-                                ? workMs : ctx.emaWorkMs * 0.9f + workMs * 0.1f;
-        }
-    }
-
-    // ── Tier selection ───────────────────────────────────────────────
-    // base(n) = Hz/(n+1). Every tier the game can sustain fills EVERY vsync
-    // slot (total == Hz — perfectly even cadence); the smallest sustainable
-    // n has the highest base → lowest latency and fewest artifacts. Only
-    // when no tier is sustainable (capability < Hz/mult) fall back to
-    // best-effort unpaced generation.
-    int numGenFrames = mult - 1;
-    ctx.paceable = false;
-    {
-        float capFps = (ctx.emaWorkMs > 0.1f) ? 1000.0f / ctx.emaWorkMs : 0.0f;
-        int hz = effectiveHz(ctx);
-        if (capFps > 1.0f) {
-            int chosen = -1;
-            for (int n = 0; n <= mult - 1; n++) {
-                float base = (float)hz / (float)(n + 1);
-                if (capFps >= base * 1.02f) { chosen = n; break; }
-            }
-            if (chosen < 0) {
-                // No tier is fully sustainable — but a FRAME-RATE-CAPPED game
-                // still belongs on the panel grid: the limiter locks it to the
-                // chosen tier's base rate and total presents == displayHz.
-                // Snap to the FIRST (highest-base) tier whose base is within
-                // 15% pull-out margin of the measured capability.
-                //   60fps-cap on 120Hz → n=1 (60+60), not n=3 (forced down to 30)
-                //   30fps-cap on 120Hz → n=3 (30+90), the classic 4x case
-                // The previous best-effort fallback mapped a flickering
-                // capFps±1fps around a tier boundary onto DIFFERENT gen counts
-                // every few frames (measured: total oscillated 120↔60↔85 on a
-                // steady 30fps game — generation "worked" but was invisible).
-                for (int n = 0; n <= mult - 1; n++) {
-                    float base = (float)hz / (float)(n + 1);
-                    if (capFps >= base * 0.85f) { chosen = n; break; }
-                }
-            }
-            if (chosen >= 0) {
-                ctx.paceable = true;
-                numGenFrames = chosen;
-            } else {
-                // Genuinely slower than even the deepest tier's reach:
-                // best-effort generation at whatever still fits the panel.
-                int slots = (int)(((float)hz * 1.02f) / capFps);
-                int maxGen = slots - 1;
-                if (maxGen < 0) maxGen = 0;
-                numGenFrames = (maxGen < mult - 1) ? maxGen : (mult - 1);
-            }
-        }
-    }
-
-    // Hysteresis on tier changes — a capability that straddles a tier
-    // boundary would flip the display cadence every few seconds, which is
-    // worse than either steady state. More generation = LOWER paced base =
-    // safer, so respond to capability drops fast (12 frames) and to
-    // capability gains slowly (90 frames ≈ 2s).
-    if (numGenFrames > 0) {
-        if (ctx.stableGen < 0) ctx.stableGen = numGenFrames;
-        if (numGenFrames > ctx.stableGen) {
-            ctx.genDownCounter = 0;
-            if (++ctx.genUpCounter >= 12) {
-                ctx.stableGen = numGenFrames;
-                ctx.genUpCounter = 0;
-            }
-        } else if (numGenFrames < ctx.stableGen) {
-            ctx.genUpCounter = 0;
-            if (++ctx.genDownCounter >= 90) {
-                ctx.stableGen = numGenFrames;
-                ctx.genDownCounter = 0;
-            }
-        } else {
-            ctx.genUpCounter = 0;
-            ctx.genDownCounter = 0;
-        }
-        if (ctx.stableGen <= mult - 1) numGenFrames = ctx.stableGen;
-    }
+    // Every present the game makes is a real frame, whether or not we generate
+    // from it. Counting it only on the generating path reported real=0 for the
+    // whole time the panel had no headroom — the GLES layer already did this
+    // correctly, and the overlay reads one channel from both.
+    ctx.stats.addReal();
 
     if (numGenFrames == 0) {
         // Game already fills the panel by itself: stay out of the way.
-        // NOTE: do NOT reset ctx.stableGen here — transient no-headroom
-        // windows (a skipped frame, a hitch) used to wipe the committed tier
-        // and the next non-zero window re-committed whatever the noisy
-        // capability said that instant, feeding the gen-count oscillation.
+        // The committed tier deliberately survives this path — see
+        // afme::Pacer::abortPresent().
         ctx.hasPrevFrame = false;
-        ctx.nextDeadlineNs = 0;
-        ctx.lastReturnNs = nowNs;  // passthrough adds no work of its own
+        ctx.pacer.abortPresent(nowNs);
+        ctx.stats.publish(nowNs);
         if ((fc % 300) == 0) {
-            ALOGI("AFME: no display headroom (cap %.1ffps @ %dHz) — passthrough",
-                  ctx.emaWorkMs > 0.0f ? 1000.0f / ctx.emaWorkMs : 0.0f,
-                  gDisplayHz.load());
+            ALOGI("AFME: no display headroom @ %dHz — passthrough",
+                  effectiveHz(ctx));
         }
         return next_vkQueuePresentKHR(queue, pPresentInfo);
     }
 
     VkImage swapImg = ctx.swapchainImages[presentIdx];
 
-    const int sgsrMode = gSgsrMode.load();
+    const int sgsrMode = afme::config().sgsrMode.load();
     // The motion method interpolates, so it must hold the real frame back until
     // the synthetic one is ready; extrapolation presents the real frame first.
     // Falls back to extrapolation if MobFGSR could not be built for this ctx.
-    const bool interpolation = (wantMotionMethod() && ctx.mobfgsrInitialized);
+    const bool interpolation = (afme::config().wantMotion() && ctx.mobfgsrInitialized);
     // Visibility for a silent downgrade: a failed MobFGSR build used to look
     // identical in logcat to interpolation working. One WARN per 300 frames.
-    if (wantMotionMethod() && !ctx.mobfgsrInitialized && ctx.mobfgsrAttempted
+    if (afme::config().wantMotion() && !ctx.mobfgsrInitialized && ctx.mobfgsrAttempted
         && (fc % 300) == 0) {
         ALOGW("AFME: method=motion requested but MobFGSR unavailable for this "
               "swapchain — falling back to extrapolation (see init errors above)");
@@ -2648,9 +2331,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         finalResult = next_vkQueuePresentKHR(queue, &realPresent);
 
         // Anchor for spacing the synthetic frames that follow.
-        struct timespec tsReal;
-        clock_gettime(CLOCK_MONOTONIC, &tsReal);
-        ctx.realPresentNs = (int64_t)tsReal.tv_sec * 1000000000LL + tsReal.tv_nsec;
+        ctx.pacer.anchorReal(afme::nowNs());
     }
 
     // Step 2b: Generate synth frames (both modes)
@@ -2702,7 +2383,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         // creation — so selecting "motion" on a running game used to silently
         // keep extrapolating. Build it on first use instead. AFME's EGL
         // context is current here, which is what initMobFGSR requires.
-        if (wantMotionMethod() && !ctx.mobfgsrInitialized && !ctx.mobfgsrAttempted) {
+        if (afme::config().wantMotion() && !ctx.mobfgsrInitialized && !ctx.mobfgsrAttempted) {
             ctx.mobfgsrAttempted = true;
             ALOGI("AFME: method=motion selected at runtime — building MobFGSR");
             initMobFGSR(ctx);
@@ -2725,7 +2406,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             applyMobFGSRPrepare(ctx);
         }
 
-        float userFactor = gFactorOverride.load();  // 0 = auto
+        float userFactor = afme::config().factorOverride.load();  // 0 = auto
         for (int i = 0; i < numGenFrames; i++) {
             // Divide by the ACTUAL number of presents per interval
             // (numGenFrames+1), not the requested multiplier. With the tier
@@ -2810,14 +2491,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         //
         // Interpolation mode anchor: the real frame is presented AFTER the
         // synths, so the anchor used by the spacing sleep must be relative to
-        // the START of the synth emission — otherwise ctx.realPresentNs stays
-        // 0 and the spacing path is silently dead for method=1 (bug D).
-        if (interpolation) {
-            struct timespec tsAnchor;
-            clock_gettime(CLOCK_MONOTONIC, &tsAnchor);
-            ctx.realPresentNs = (int64_t)tsAnchor.tv_sec * 1000000000LL
-                                + tsAnchor.tv_nsec;
-        }
+        // the START of the synth emission — otherwise the anchor stays 0 and
+        // the spacing path is silently dead for method=1 (bug D).
+        if (interpolation) ctx.pacer.anchorReal(afme::nowNs());
         for (int i = 0; i < numGenFrames; i++) {
             VkSemaphore acquireSem = ctx.acquireSem();
             if (acquireSem == VK_NULL_HANDLE) {
@@ -2896,9 +2572,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             // opt-in via persist.sys.afme.pacing for future SF releases.
             VkPresentTimeGOOGLE presentTime = {};
             VkPresentTimesInfoGOOGLE timesInfo = {};
-            if (gPacingEnabled.load(std::memory_order_relaxed) &&
-                ctx.hasDisplayTiming && ctx.emaFrameMs > 0.0f) {
-                int64_t offsetNs = (int64_t)(ctx.emaFrameMs * 1e6f *
+            if (afme::config().pacing.load(std::memory_order_relaxed) &&
+                ctx.hasDisplayTiming && ctx.pacer.intervalMs() > 0.0f) {
+                int64_t offsetNs = (int64_t)(ctx.pacer.intervalMs() * 1e6f *
                                              (float)(i + 1) / (float)(numGenFrames + 1))
                                    - 4000000LL;
                 if (offsetNs < 0) offsetNs = 0;
@@ -2918,30 +2594,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             //
             // Scaled by the governor, so if the sleep turns out to cost the
             // game real frames this decays to a no-op on its own.
-            if (gSpacingEnabled.load(std::memory_order_relaxed) &&
-                ctx.spacingScale > 0.01f && ctx.emaFrameMs > 0.0f &&
-                ctx.realPresentNs > 0) {
-                int64_t intervalNs = (int64_t)(ctx.emaFrameMs * 1e6f);
-                int64_t slotNs = intervalNs / (int64_t)(numGenFrames + 1);
-                int64_t offsetNs = (int64_t)((float)(slotNs * (int64_t)(i + 1))
-                                             * ctx.spacingScale);
-                struct timespec tsNow2;
-                clock_gettime(CLOCK_MONOTONIC, &tsNow2);
-                int64_t curNs = (int64_t)tsNow2.tv_sec * 1000000000LL
-                                + tsNow2.tv_nsec;
-                int64_t sleepNs = (ctx.realPresentNs + offsetNs) - curNs;
-                // Below ~0.3ms nanosleep costs more than it buys; above 50ms
-                // something is wrong with the interval estimate — do not hang
-                // the game thread on it.
-                if (sleepNs > 300000LL && sleepNs < 50000000LL) {
-                    struct timespec req = { (time_t)(sleepNs / 1000000000LL),
-                                            (long)(sleepNs % 1000000000LL) };
-                    nanosleep(&req, nullptr);
-                }
-            }
+            ctx.pacer.spaceSynth(i, numGenFrames);
 
             next_vkQueuePresentKHR(queue, &genPresent);
-            ctx.genFrames++;
+            ctx.stats.addGen();
         }
 
         ctx.drainPending = synthSubmitted;
@@ -2977,89 +2633,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     if ((fc % 300) == 0) {
         ALOGI("AFME: Frame %lu — %dx active (%d gen/frame), gen=%lu total",
               (unsigned long)fc, mult, numGenFrames,
-              (unsigned long)ctx.genFrames);
+              (unsigned long)ctx.frameIdx);
     }
 
-    // ── FPS Stats ────────────────────────────────────────────────────
-    // property_set() from a game process can never work: platform sepolicy
-    // has `neverallow all_untrusted_apps property_type:property_service set`.
-    // Export via a once-per-second log line instead — GameSpace (system_app,
-    // READ_LOGS) parses "AFME-STATS" from logcat for the overlay.
-    //
-    // State lives in the CONTEXT, not statics: games recreate swapchains
-    // (ZZZ makes several at startup), and a static baseline from the old
-    // swapchain underflows against the new context's small counters
-    // (observed: "real=2147483647 total=-2" for one window).
-    {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t nowStatNs = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+    // ── FPS stats ────────────────────────────────────────────────────
+    // Published as a log line because property_set() from a game process can
+    // never work: platform sepolicy carries `neverallow all_untrusted_apps
+    // property_type:property_service set`. GameSpace (system_app, READ_LOGS)
+    // parses "AFME-STATS" out of logcat for the overlay.
+    ctx.stats.publish(afme::nowNs());
 
-        if (ctx.statsBaseNs == 0) {
-            // First frame for this context: initialize baseline
-            ctx.statsBaseNs = nowStatNs;
-            ctx.statsBaseReal = ctx.frameIdx;
-            ctx.statsBaseGen = ctx.genFrames;
-        } else {
-            double elapsed = (double)(nowStatNs - ctx.statsBaseNs) / 1e9;
-            if (elapsed >= 1.0) {
-                uint64_t realDelta = ctx.frameIdx - ctx.statsBaseReal;
-                uint64_t genDelta = ctx.genFrames - ctx.statsBaseGen;
-                int realFps = (int)(realDelta / elapsed + 0.5);
-                int genFps = (int)(genDelta / elapsed + 0.5);
-
-                ALOGI("AFME-STATS real=%d gen=%d total=%d",
-                      realFps, genFps, realFps + genFps);
-
-                ctx.statsBaseNs = nowStatNs;
-                ctx.statsBaseReal = ctx.frameIdx;
-                ctx.statsBaseGen = ctx.genFrames;
-            }
-        }
-    }
-
-    // ── AFME frame limiter (Swappy-style pacing) ─────────────────────
-    // Pace the game to exactly (numGen+1) vsync slots so total presents
-    // fill every slot: 120Hz / 3 = locked 40fps base → steady 120 total.
-    // Precise sleep here beats FIFO back-pressure pacing, which blocks the
-    // game at unpredictable points (measured: 24-58ms stall tail at SF).
-    // Only engage when the tier is sustainable — sleeping a game that
-    // cannot reach the target would just add latency.
-    struct timespec tsEnd;
-    clock_gettime(CLOCK_MONOTONIC, &tsEnd);
-    int64_t endNs = (int64_t)tsEnd.tv_sec * 1000000000LL + tsEnd.tv_nsec;
-
-    if (gLimiterEnabled.load(std::memory_order_relaxed) && numGenFrames > 0 &&
-        ctx.paceable) {
-        // Prefer the measured vsync period; fall back to inverting the prop.
-        int64_t vsyncNs = (ctx.refreshCycleNs >= 2000000 &&
-                           ctx.refreshCycleNs <= 100000000)
-                              ? (int64_t)ctx.refreshCycleNs
-                              : 1000000000LL / (int64_t)gDisplayHz.load(std::memory_order_relaxed);
-        int64_t targetNs = (int64_t)(numGenFrames + 1) * vsyncNs;
-        if (ctx.nextDeadlineNs <= 0) {
-            ctx.nextDeadlineNs = endNs + targetNs;
-        } else {
-            int64_t sleepNs = ctx.nextDeadlineNs - endNs;
-            if (sleepNs > 300000 && sleepNs < 100000000LL) {
-                struct timespec req = { (time_t)(sleepNs / 1000000000LL),
-                                        (long)(sleepNs % 1000000000LL) };
-                nanosleep(&req, nullptr);
-                clock_gettime(CLOCK_MONOTONIC, &tsEnd);
-                endNs = (int64_t)tsEnd.tv_sec * 1000000000LL + tsEnd.tv_nsec;
-            }
-            ctx.nextDeadlineNs += targetNs;
-            // Fell behind (heavy frame) — resync instead of rushing to
-            // catch up, which would bunch presents.
-            if (ctx.nextDeadlineNs < endNs) ctx.nextDeadlineNs = endNs + targetNs;
-        }
-    } else {
-        ctx.nextDeadlineNs = 0;
-    }
-
-    // Capability measurement anchor: the game's next frame of work starts
-    // from the moment we return (after any pacing sleep).
-    ctx.lastReturnNs = endNs;
+    // Pace the game to exactly (numGen+1) vsync slots so total presents fill
+    // every slot: 120Hz / 3 = a locked 40fps base, a steady 120 total. Prefer
+    // the measured vsync period; fall back to inverting the staged prop.
+    const int64_t vsyncNs = (ctx.refreshCycleNs >= 2000000 &&
+                             ctx.refreshCycleNs <= 100000000)
+                                ? (int64_t)ctx.refreshCycleNs
+                                : 1000000000LL / (int64_t)effectiveHz(ctx);
+    ctx.pacer.endPresent(afme::nowNs(), numGenFrames, tier.paceable, vsyncNs);
 
     return finalResult;
 }
