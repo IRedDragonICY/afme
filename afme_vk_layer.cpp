@@ -79,10 +79,19 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLDESTROYIMAGEKHRPROC)(EGLDisplay, void*);
 // QCOM motion estimation + depth estimation HW accelerators
 typedef void (GL_APIENTRYP PFNGLTEXESTIMATEMOTIONQCOMPROC)(GLuint, GLuint, GLuint);
 typedef void (GL_APIENTRYP PFNGLTEXGENERATEDISPARITYQCOMPROC)(GLuint, GLuint);
+typedef void (GL_APIENTRYP PFNGLSHADINGRATEQCOMPROC)(GLenum);
 
 // QCOM motion estimation search block size query tokens
 #define GL_MOTION_ESTIMATION_SEARCH_BLOCK_X_QCOM 0x8C90
 #define GL_MOTION_ESTIMATION_SEARCH_BLOCK_Y_QCOM 0x8C91
+
+// GL_QCOM_shading_rate — ABI values match ANGLE's include/GLES2/gl2ext.h
+#ifndef GL_SHADING_RATE_1X1_PIXELS_QCOM
+#define GL_SHADING_RATE_1X1_PIXELS_QCOM 0x96A6
+#endif
+#ifndef GL_SHADING_RATE_2X2_PIXELS_QCOM
+#define GL_SHADING_RATE_2X2_PIXELS_QCOM 0x96A9
+#endif
 
 // ─── Global next-layer function pointers ────────────────────────────────────
 namespace {
@@ -136,15 +145,49 @@ PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR next_vkGetPhysicalDeviceSurfaceCap
 PFN_vkEnumerateDeviceExtensionProperties next_vkEnumerateDeviceExtensionProperties{};
 PFN_vkGetFenceFdKHR           next_vkGetFenceFdKHR{};
 PFN_vkImportSemaphoreFdKHR    next_vkImportSemaphoreFdKHR{};
+PFN_vkGetRefreshCycleDurationGOOGLE next_vkGetRefreshCycleDurationGOOGLE{};
 
 // ─── Global State ───────────────────────────────────────────────────────────
 
 std::atomic<bool> gEnabled{false};
 std::atomic<int> gMultiplier{2};  // 2x, 3x, 4x
 std::atomic<float> gFactorOverride{0.0f};  // 0 = auto (compute from multiplier)
-std::atomic<int> gSgsrMode{0};    // 0=off, 1=SGSR1, 2=SGSR2, 3=MobFGSR
+std::atomic<int> gSgsrMode{0};    // 0=off, 1=SGSR1, 2=SGSR2, 3=MobFGSR (legacy)
+
+// Frame-generation method — which primitive synthesizes the frame. Kept
+// separate from gSgsrMode, which selects *upscaling/sharpening* and is an
+// orthogonal choice: you can sharpen either method's output.
+//   FG_EXTRAPOLATE  glExtrapolateTex2DQCOM — driver black box, one call.
+//   FG_MOTION       glTexEstimateMotionQCOM + MobFGSR reproject/warp.
+enum FGMethod {
+    FG_EXTRAPOLATE = 0,
+    FG_MOTION      = 1,
+};
+std::atomic<int> gMethod{FG_EXTRAPOLATE};
+
+// True when the motion-estimation pipeline should be built/used. sgsr.mode==3
+// is the legacy spelling of the same request and stays honoured so existing
+// per-game configs keep working.
+static inline bool wantMotionMethod() {
+    return gMethod.load() == FG_MOTION || gSgsrMode.load() == 3;
+}
 std::atomic<bool> gSmoothMotion{true};
 std::atomic<int> gDisplayHz{120}; // panel rate published by GameStateDispatcher
+// Apply GL_QCOM_shading_rate to our own full-screen fragment passes (SGSR1
+// sharpen, MobFGSR luma conversion). 2x2 VRS quarters fragment cost of frame
+// generation; compute dispatches are unaffected by VRS. Never touches the
+// game's rendering (our passes run on the hidden EGL context).
+std::atomic<bool> gVrsFgEnabled{true};
+// HUD ghost protection: accumulate a screen-static region mask per ME block
+// and pin those pixels to the current real frame in the warp (kills the
+// classic FG "shadow trail" on minimap/bars/buttons).
+std::atomic<bool> gHudMaskEnabled{true};
+// Anti-ghost for MOVING content (v8): deep-occlusion holes anchor to the
+// real current pixel instead of blending two MV-guessed samples, and any
+// high-disagreement blend damps toward the temporally closer sample — the
+// two mechanisms behind character-silhouette "shadow trails" (most visible
+// on the running character at screen center while panning the camera).
+std::atomic<bool> gAntiGhostEnabled{true};
 // desiredPresentTime pacing (VK_GOOGLE_display_timing). Default OFF: measured
 // on onyx (SF version bp4a) that SurfaceFlinger drops >50% of the delayed
 // synth buffers (droppedFrames 0→230/648) instead of holding them, making
@@ -156,6 +199,18 @@ std::atomic<bool> gPacingEnabled{false};
 // city (36-43fps): without this, the base straddles the clamp boundary at
 // 40.8fps and the cadence flips 120↔86 total every few seconds (stutter).
 std::atomic<bool> gLimiterEnabled{true};
+// Synthetic-frame spacing. Presenting the synth frame straight after the real
+// one puts it in the very next vsync slot, so at a 30fps game on a 120Hz panel
+// the real frame is visible for 8ms and the synthetic one for 25ms (measured
+// present2present: 8ms×856, 24ms×594). That is 60 presents/second that still
+// read as 30fps with a strobe. Spacing them across the game's frame interval
+// is what actually makes generation visible.
+//
+// This is NOT the same mechanism as gPacingEnabled above: that one asks
+// SurfaceFlinger to hold a buffer via desiredPresentTime and SF drops it
+// instead. This one delays our own vkQueuePresentKHR call, which SF cannot
+// second-guess.
+std::atomic<bool> gSpacingEnabled{true};
 std::atomic<uint64_t> gFrameCount{0};
 std::mutex gLock;
 
@@ -306,6 +361,12 @@ void checkProperties() {
     int sgsr = atoi(value);
     if (sgsr >= 0 && sgsr <= 3) gSgsrMode.store(sgsr);  // 0=off, 1=SGSR1, 2=SGSR2, 3=MobFGSR
 
+    // Frame-generation method. Anything unrecognised means extrapolation, which
+    // needs no shaders and so can never fail to initialize.
+    property_get("persist.sys.afme.method", value, "0");
+    int method = atoi(value);
+    gMethod.store((method == FG_MOTION) ? FG_MOTION : FG_EXTRAPOLATE);
+
     // Smooth Motion (set by GameStateDispatcher via persist.sys.* namespace)
     property_get("persist.sys.afme.smooth_motion", value, "1");
     gSmoothMotion.store(value[0] == '1');
@@ -322,6 +383,18 @@ void checkProperties() {
 
     property_get("persist.sys.afme.limiter", value, "1");
     gLimiterEnabled.store(value[0] == '1');
+
+    property_get("persist.sys.afme.spacing", value, "1");
+    gSpacingEnabled.store(value[0] == '1');
+
+    property_get("persist.sys.afme.vrs_fg", value, "1");
+    gVrsFgEnabled.store(value[0] == '1');
+
+    property_get("persist.sys.afme.hud_mask", value, "1");
+    gHudMaskEnabled.store(value[0] == '1');
+
+    property_get("persist.sys.afme.anti_ghost", value, "1");
+    gAntiGhostEnabled.store(value[0] == '1');
 }
 
 static uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& memProps,
@@ -413,9 +486,32 @@ struct AFMEContext {
     uint64_t statsBaseReal = 0;
     uint64_t statsBaseGen = 0;
 
+    // Engagement gate: is this swapchain a game render loop, or a UI window?
+    bool engaged = false;
+    int engageRun = 0;
+    int64_t engageLastNs = 0;
+    float engageEmaMs = 0.0f;
+
+    // Synthetic-frame spacing
+    int64_t realPresentNs = 0;   // when this frame's real present was issued
+    float spacingScale = 0.0f;   // 0 = present immediately, 1 = full spacing
+    float bestRealFps = 0.0f;    // reference rate the governor protects
+
+    // MobFGSR is built at swapchain creation, but the method property can flip
+    // mid-session; this lets us build it on first use without retrying forever.
+    bool mobfgsrAttempted = false;
+
     // VK_GOOGLE_display_timing pacing for synthetic frames
     bool hasDisplayTiming = false;
     uint32_t presentId = 0;
+    // Measured panel refresh cycle (vkGetRefreshCycleDurationGOOGLE); 0 = use
+    // the gDisplayHz prop instead. Vsync grid
+    // calibration: the panel CAN differ from the staged prop (e.g. Battery
+    // Saver votes 60Hz over the GameStateDispatcher force), and tier/limiter
+    // math against the wrong grid produced exactly the invisible-generation
+    // cadence seen on device.
+    uint64_t refreshCycleNs = 0;
+    PFNGLSHADINGRATEQCOMPROC glShadingRate = nullptr;
 
     // Native-fence (sync_fd) VK↔GLES interop — replaces vkWaitForFences and
     // glFinish on the game's render thread with GPU-side waits.
@@ -452,7 +548,10 @@ struct AFMEContext {
 
     // ─── MobFGSR resources ───────────────────────────────────
     bool mobfgsrInitialized = false;
-    GLuint lumaConvertProg = 0;    // RGB→R8 luminance
+    GLuint lumaConvertProg = 0;    // RGB→R8 luminance (render pass, not compute)
+    GLuint lumaFbo = 0;            // render target for the luminance pass
+    GLuint lumaVao = 0;            // empty VAO for the fullscreen triangle
+    GLint  lumaSrcLoc = -1;
     GLuint mvUpsampleProg = 0;     // Block-level MV → per-pixel MV
     GLuint dilateProg = 0;         // Nearest-depth dilation
     GLuint clearProg = 0;          // Clear reprojection buffer
@@ -476,6 +575,16 @@ struct AFMEContext {
     GLuint reprojectionTex = 0;    // R32UI, reproject scatter buf
     GLuint filledReprojTex = 0;    // R32UI, filled reprojection
     GLuint fgResultTex = 0;        // RGBA8, frame gen result
+
+    // ── HUD ghost protection ────────────────────────────────────────────
+    // Per-block (motion-grid) accumulation of screen-STATIC content
+    // (minimap, HP bars, buttons, subtitles). Moving world pixels fail the
+    // "static" test, so the warp keeps blending them normally; HUD pixels
+    // are locked to the current real frame instead of the warped/interpolated
+    // value — which is what stops the classic FG "shadow trail" on UI.
+    GLuint hudMaskProg = 0;        // block-grid static accumulation
+    GLuint hudMaskTex = 0;         // R8, W/blockX × H/blockY (write side)
+    GLuint prevHudMaskTex = 0;     // R8, read side (baseline, swapped)
 
     bool initialized = false;
     bool afmeHWAvailable = false;
@@ -501,6 +610,25 @@ struct AFMEContext {
         return cb;
     }
 };
+
+// Effective panel rate: prefer the measured refresh cycle (display_timing)
+// over the staged prop — the two can disagree (Battery Saver 60Hz vote,
+// 90Hz override sessions, future panels), and running the tier/limiter math
+// on the wrong grid is how generation becomes invisible.
+static inline int effectiveHz(const AFMEContext& ctx) {
+    if (ctx.refreshCycleNs >= 2000000 && ctx.refreshCycleNs <= 100000000) { // 10..500 Hz
+        int hz = (int)(1000000000.0 / (double)ctx.refreshCycleNs + 0.5);
+        if (hz >= 10 && hz <= 500) return hz;
+    }
+    return gDisplayHz.load(std::memory_order_relaxed);
+}
+
+// Set fragment shading rate for our passes when the driver supports it.
+static inline void setFgShadingRate(const AFMEContext& ctx, GLenum rate) {
+    if (ctx.glShadingRate && gVrsFgEnabled.load(std::memory_order_relaxed)) {
+        ctx.glShadingRate(rate);
+    }
+}
 
 // Swapchain → context mapping
 std::unordered_map<VkSwapchainKHR, AFMEContext> gSwapchainContexts;
@@ -579,6 +707,11 @@ static bool initEGLContext(AFMEContext& ctx) {
     // advertised extension. Safe to call.
     ctx.glTexEstimateMotion = (PFNGLTEXESTIMATEMOTIONQCOMPROC)
         eglGetProcAddress("glTexEstimateMotionQCOM");
+
+    // VRS for our own fragment passes (generation cost drops ~4x on the
+    // shaded passes)
+    ctx.glShadingRate = (PFNGLSHADINGRATEQCOMPROC)
+        eglGetProcAddress("glShadingRateQCOM");
 
     // glTexGenerateDisparityQCOM is deliberately NOT resolved. RE of the
     // driver export shows its real ABI is
@@ -697,8 +830,10 @@ static void applySGSR1(AFMEContext& ctx, GLuint inputTex, GLuint outputTex,
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
 
+    setFgShadingRate(ctx, GL_SHADING_RATE_2X2_PIXELS_QCOM);
     glBindVertexArray(ctx.sgsrVao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    setFgShadingRate(ctx, GL_SHADING_RATE_1X1_PIXELS_QCOM);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindVertexArray(0);
@@ -710,16 +845,32 @@ static void applySGSR1(AFMEContext& ctx, GLuint inputTex, GLuint outputTex,
 // Pipeline: HW motion estimation → dilate → clear → reproject → fill → warp
 // Based on MobFGSR (BSD-3 license) adapted for Adreno 840 HW primitives.
 
-// Compute shader: RGB → R8 luminance for motion estimation input
-static const char* kLumaConvertSrc = R"(#version 310 es
-layout(local_size_x=8,local_size_y=8) in;
-layout(rgba8, binding=0) readonly uniform mediump image2D srcColor;
-layout(r8, binding=1) writeonly uniform mediump image2D dstLuma;
+// RGB → R8 luminance for motion estimation input.
+//
+// Done as a render-to-texture pass, not a compute imageStore: `r8` is not a
+// required image format in GLSL ES 3.1/3.2, and this Adreno build does not
+// expose GL_NV_image_formats, so `layout(r8, ...)` fails to compile with
+// "not a legal layout qualifier id". R8 *is* colour-renderable though, so a
+// plain fragment shader writing into an FBO works and keeps the single-channel
+// format glTexEstimateMotionQCOM expects for its inputs.
+static const char* kLumaVertSrc = R"(#version 300 es
+out vec2 vUV;
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    vec4 c = imageLoad(srcColor, p);
-    float luma = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
-    imageStore(dstLuma, p, vec4(luma));
+    // ids 0,1,2 -> (-1,-1), (3,-1), (-1,3): one triangle covering the viewport
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
+                  (gl_VertexID == 2) ? 3.0 : -1.0);
+    vUV = (p + 1.0) * 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+})";
+
+static const char* kLumaFragSrc = R"(#version 300 es
+precision mediump float;
+uniform mediump sampler2D uSrc;
+in vec2 vUV;
+out vec4 outColor;
+void main() {
+    vec3 c = texture(uSrc, vUV).rgb;
+    outColor = vec4(0.299 * c.r + 0.587 * c.g + 0.114 * c.b, 0.0, 0.0, 1.0);
 })";
 
 // Compute shader: Bilinear upsample block-level MVs → per-pixel MVs
@@ -728,7 +879,7 @@ void main() {
 static const char* kMVUpsampleSrc = R"(#version 310 es
 layout(local_size_x=8,local_size_y=8) in;
 uniform mediump sampler2D blockMV;
-layout(rg16f, binding=0) writeonly uniform mediump image2D perPixelMV;
+layout(rgba16f, binding=0) writeonly uniform mediump image2D perPixelMV;
 uniform ivec2 renderSize;
 uniform ivec2 blockSize;
 void main() {
@@ -749,7 +900,7 @@ layout(local_size_x=8,local_size_y=8) in;
 layout(binding=0) uniform mediump sampler2D r_depth;
 layout(binding=1) uniform mediump sampler2D r_mv;
 layout(r32f, binding=0) writeonly uniform highp image2D rw_dilated_depth;
-layout(rg16f, binding=1) writeonly uniform mediump image2D rw_dilated_mv;
+layout(rgba16f, binding=1) writeonly uniform mediump image2D rw_dilated_mv;
 uniform ivec2 renderSize;
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
@@ -779,6 +930,11 @@ void main() {
 
 // Compute shader: Reproject with atomicMin (from MobFGSR Reproject_I.comp)
 static const char* kReprojectSrc = R"(#version 310 es
+// imageAtomicMin is not core until ES 3.2; on 3.1 it must be asked for by name.
+// Adreno 840 advertises GL_OES_shader_image_atomic, so this compiles here —
+// without it the shader failed with "requires extension ... to be enabled" and
+// took the whole MobFGSR pipeline down with it.
+#extension GL_OES_shader_image_atomic : require
 layout(local_size_x=8,local_size_y=8) in;
 layout(binding=0) uniform mediump sampler2D r_depth;
 layout(binding=1) uniform mediump sampler2D r_cur_mv;
@@ -860,6 +1016,53 @@ void main() {
     imageStore(rw_filled, pos, uvec4(result));
 })";
 
+// Compute shader: HUD mask — per-BLOCK accumulation of screen-static content
+// (minimap frames, HP bars, buttons, prompts). Runs on the motion-estimation
+// block grid (8x8 px on Adreno 840), so one texel per ME block; the warp
+// shader bilinearly upsamples it for free.
+//
+// Two tests, both required — luma alone is fooled by static sky/ground, MV
+// alone is fooled by small-magnitude real motion:
+//   1. 9-tap mean |Δluma| at the block centre ≈ 0   (content isn't changing)
+//   2. the block's motion vector length < threshold (ME agrees it isn't moving)
+// A static block accumulates toward 1 (+0.10/frame ≈ 10 frames to lock), a
+// moved block releases fast (−0.50/frame ≈ 2 frames) so it can never smear.
+// Note this is SAFE for static WORLD content too: static world pixels are
+// identical in curr and prev, so pinning them to curr is exact, not a guess.
+static const char* kHudMaskSrc = R"(#version 310 es
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform mediump sampler2D r_curr_luma;
+layout(binding=1) uniform mediump sampler2D r_prev_luma;
+layout(binding=2) uniform highp sampler2D r_block_mv;
+layout(binding=3) uniform mediump sampler2D r_prev_mask;
+layout(r8, binding=0) writeonly uniform mediump image2D rw_mask;
+uniform ivec2 lumaSize;
+uniform ivec2 blockSize;
+uniform float lumaThr;
+uniform float mvThr;
+uniform float upRate;
+uniform float downRate;
+void main() {
+    ivec2 blk = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 maskSize = imageSize(rw_mask);
+    if (any(greaterThanEqual(blk, maskSize))) return;
+    ivec2 c = blk * blockSize + blockSize / 2;
+    float diff = 0.0;
+    for (int dy = -2; dy <= 2; dy += 2) {
+        for (int dx = -2; dx <= 2; dx += 2) {
+            ivec2 p = clamp(c + ivec2(dx, dy), ivec2(0), lumaSize - ivec2(1));
+            diff += abs(texelFetch(r_curr_luma, p, 0).x -
+                        texelFetch(r_prev_luma, p, 0).x);
+        }
+    }
+    diff /= 9.0;
+    vec2 mvPx = texelFetch(r_block_mv, blk, 0).xy;
+    bool isStatic = (diff < lumaThr) && (length(mvPx) < mvThr);
+    float prev = texelFetch(r_prev_mask, blk, 0).x;
+    float m = clamp(prev + (isStatic ? upRate : -downRate), 0.0, 1.0);
+    imageStore(rw_mask, blk, vec4(m));
+})";
+
 // Compute shader: Warp + blend interpolation (from MobFGSR Warp_I.comp)
 static const char* kWarpSrc = R"(#version 310 es
 layout(local_size_x=8,local_size_y=8) in;
@@ -870,11 +1073,15 @@ layout(binding=3) uniform mediump sampler2D r_cur_depth;
 layout(binding=4) uniform mediump sampler2D r_prev_depth;
 layout(binding=5) uniform mediump sampler2D r_cur_mv;
 layout(binding=6) uniform mediump sampler2D r_prev_mv;
+layout(binding=7) uniform mediump sampler2D r_hud_mask;
 layout(rgba8, binding=0) writeonly uniform mediump image2D rw_result;
 uniform ivec2 renderSize;
 uniform float delta;
 uniform float depthThreshold;
 uniform float colorThreshold;
+uniform float hudStrength;
+uniform float holeAnchor;    // 1 = pin deep-occlusion holes to the real pixel
+uniform float ghostStrength; // 1 = damp blend when warped samples disagree
 const uint INV = 0xFFFFFFFFu;
 const uint depthBits = 11u;
 const uint xBits = 11u;
@@ -895,6 +1102,19 @@ void main() {
     vec2 mv_t1;
     ivec2 srcPos = ivec2(-1);
     if (packed == INV) {
+        // DEEP HOLE: the scatter-reprojection placed no source here — this is
+        // a disocclusion (background revealed behind the moving character,
+        // content entering past the frame edge). The legacy behaviour guessed
+        // an MV from the *previous* frame's field and blended two warped
+        // samples along it — the exact manufacturing recipe for the classic
+        // frame-gen double-exposure "shadow trail" trailing the character.
+        // Anchoring to the real current pixel is artifact-free: the content
+        // at that exact location is the CORRECT instantaneous content.
+        if (holeAnchor > 0.5) {
+            vec3 px = texelFetch(r_cur_color, pos, 0).rgb;
+            imageStore(rw_result, pos, vec4(px, 1.0));
+            return;
+        }
         mv_t1 = texelFetch(r_prev_mv, pos, 0).xy;
     } else {
         srcPos = unpackSrc(packed, pos);
@@ -931,9 +1151,30 @@ void main() {
             color = delta < 0.5 ? c0 : c1;
         } else {
             color = mix(c0, c1, delta);
+            // Anti-ghost damping: a large disagreement between the two warped
+            // samples means this pixel's MV is unreliable (silhouette edge of
+            // a running character, animated/damage text, ME miss). Blending
+            // them 50/50 manufactures two offset ghosts; damping toward the
+            // temporally closer sample keeps ONE clean image instead.
+            float ghost = clamp((ld - colorThreshold) * 8.0, 0.0, 1.0)
+                          * ghostStrength;
+            if (ghost > 0.0) {
+                vec3 near_ = delta < 0.5 ? c0 : c1;
+                color = mix(color, near_, ghost * 0.75);
+            }
         }
     } else {
         color = d1 > d0 ? c1 : c0;
+    }
+
+    // HUD ghost protection: screen-static pixels (minimap, bars, prompts)
+    // must NOT show the interpolated blend — anchor them to the real current
+    // frame at their exact position. Static world pixels are unaffected in
+    // practice (they match curr anyway).
+    float hud = textureLod(r_hud_mask, uv, 0.0).x * hudStrength;
+    if (hud > 0.0) {
+        vec3 px = texelFetch(r_cur_color, pos, 0).rgb;
+        color = mix(color, px, clamp(hud, 0.0, 1.0));
     }
     imageStore(rw_result, pos, vec4(color, 1.0));
 })";
@@ -999,16 +1240,44 @@ static bool initMobFGSR(AFMEContext& ctx) {
     ALOGI("AFME: Motion estimation block size: %dx%d", ctx.motionBlockX, ctx.motionBlockY);
 
     // Compile all compute shaders
-    ctx.lumaConvertProg = compileComputeProgram(kLumaConvertSrc, "LumaConvert");
+    // Luminance is a render pass (see kLumaFragSrc for why it cannot be compute)
+    {
+        GLuint vs = compileShader(GL_VERTEX_SHADER, kLumaVertSrc);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, kLumaFragSrc);
+        if (vs && fs) {
+            ctx.lumaConvertProg = glCreateProgram();
+            glAttachShader(ctx.lumaConvertProg, vs);
+            glAttachShader(ctx.lumaConvertProg, fs);
+            glLinkProgram(ctx.lumaConvertProg);
+            GLint linked = 0;
+            glGetProgramiv(ctx.lumaConvertProg, GL_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[512];
+                glGetProgramInfoLog(ctx.lumaConvertProg, sizeof(log), nullptr, log);
+                ALOGE("AFME: Luma program link error: %s", log);
+                glDeleteProgram(ctx.lumaConvertProg);
+                ctx.lumaConvertProg = 0;
+            } else {
+                ctx.lumaSrcLoc = glGetUniformLocation(ctx.lumaConvertProg, "uSrc");
+                glGenFramebuffers(1, &ctx.lumaFbo);
+                glGenVertexArrays(1, &ctx.lumaVao);
+                ALOGI("AFME: Luma render program ready (prog=%u)", ctx.lumaConvertProg);
+            }
+        }
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+    }
     ctx.mvUpsampleProg = compileComputeProgram(kMVUpsampleSrc, "MVUpsample");
     ctx.dilateProg = compileComputeProgram(kDilateSrc, "Dilate");
     ctx.clearProg = compileComputeProgram(kClearSrc, "Clear");
     ctx.reprojectProg = compileComputeProgram(kReprojectSrc, "Reproject");
     ctx.fillProg = compileComputeProgram(kFillSrc, "Fill");
     ctx.warpProg = compileComputeProgram(kWarpSrc, "Warp");
+    ctx.hudMaskProg = compileComputeProgram(kHudMaskSrc, "HudMask");
 
     if (!ctx.lumaConvertProg || !ctx.mvUpsampleProg || !ctx.dilateProg ||
-        !ctx.clearProg || !ctx.reprojectProg || !ctx.fillProg || !ctx.warpProg) {
+        !ctx.clearProg || !ctx.reprojectProg || !ctx.fillProg ||
+        !ctx.warpProg || !ctx.hudMaskProg) {
         ALOGE("AFME: MobFGSR shader compilation failed");
         return false;
     }
@@ -1020,21 +1289,38 @@ static bool initMobFGSR(AFMEContext& ctx) {
     ctx.prevLumaTex = createGLTex(GL_R8, w, h, GL_NEAREST);
     ctx.currLumaTex = createGLTex(GL_R8, w, h, GL_NEAREST);
     ctx.motionVecBlockTex = createGLTex(GL_RGBA16F, mvW, mvH, GL_LINEAR);
-    ctx.motionVecTex = createGLTex(GL_RG16F, w, h, GL_NEAREST);
-    ctx.prevMotionVecTex = createGLTex(GL_RG16F, w, h, GL_NEAREST);
+    ctx.motionVecTex = createGLTex(GL_RGBA16F, w, h, GL_NEAREST);
+    ctx.prevMotionVecTex = createGLTex(GL_RGBA16F, w, h, GL_NEAREST);
     ctx.depthTex = createGLTex(GL_R32F, w, h, GL_NEAREST);
     ctx.prevDepthTex = createGLTex(GL_R32F, w, h, GL_NEAREST);
     ctx.dilatedDepthTex = createGLTex(GL_R32F, w, h, GL_NEAREST);
-    ctx.dilatedMVTex = createGLTex(GL_RG16F, w, h, GL_NEAREST);
+    ctx.dilatedMVTex = createGLTex(GL_RGBA16F, w, h, GL_NEAREST);
     ctx.prevDilatedDepthTex = createGLTex(GL_R32F, w, h, GL_NEAREST);
-    ctx.prevDilatedMVTex = createGLTex(GL_RG16F, w, h, GL_NEAREST);
+    ctx.prevDilatedMVTex = createGLTex(GL_RGBA16F, w, h, GL_NEAREST);
     ctx.reprojectionTex = createGLTex(GL_R32UI, w, h, GL_NEAREST);
     ctx.filledReprojTex = createGLTex(GL_R32UI, w, h, GL_NEAREST);
     ctx.fgResultTex = createGLTex(GL_RGBA8, w, h, GL_LINEAR);
 
+    // HUD mask ping-pong at the ME block grid; LINEAR so the warp pass gets
+    // soft mask edges for free (hard 8px block edges would halo visibly).
+    ctx.hudMaskTex = createGLTex(GL_R8, mvW, mvH, GL_LINEAR);
+    ctx.prevHudMaskTex = createGLTex(GL_R8, mvW, mvH, GL_LINEAR);
+
+    // Initialize both mask sides to 0 (no HUD assumed) — garbage would
+    // otherwise pollute the first seconds of accumulation.
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx.lumaFbo);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, ctx.hudMaskTex, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, ctx.prevHudMaskTex, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
     ctx.mobfgsrInitialized = true;
-    ALOGI("AFME: MobFGSR initialized (%ux%u, MV block %dx%d → %ux%u)",
-          w, h, ctx.motionBlockX, ctx.motionBlockY, mvW, mvH);
+    ALOGI("AFME: MobFGSR initialized (%ux%u, MV block %dx%d → %ux%u, hud mask %ux%u)",
+          w, h, ctx.motionBlockX, ctx.motionBlockY, mvW, mvH, mvW, mvH);
     return true;
 }
 
@@ -1049,12 +1335,28 @@ static void applyMobFGSRPrepare(AFMEContext& ctx) {
     int gx = (w + 7) / 8;
     int gy = (h + 7) / 8;
 
-    // Step 1: Convert current frame to luminance (R8) for HW motion estimation
+    // Step 1: Convert current frame to luminance (R8) for HW motion estimation.
+    // Render pass rather than compute — r8 is not a legal image-store format
+    // here (no GL_NV_image_formats on this driver).
     glUseProgram(ctx.lumaConvertProg);
-    glBindImageTexture(0, ctx.currFrame.glTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
-    glBindImageTexture(1, ctx.currLumaTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
-    glDispatchCompute(gx, gy, 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx.lumaFbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, ctx.currLumaTex, 0);
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ctx.currFrame.glTex);
+    if (ctx.lumaSrcLoc >= 0) glUniform1i(ctx.lumaSrcLoc, 0);
+    glBindVertexArray(ctx.lumaVao);
+    // Luma is already a downsampled input for block ME — shade it at 2x2.
+    setFgShadingRate(ctx, GL_SHADING_RATE_2X2_PIXELS_QCOM);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    setFgShadingRate(ctx, GL_SHADING_RATE_1X1_PIXELS_QCOM);
+    // Detach before glTexEstimateMotionQCOM samples currLumaTex: reading a
+    // texture still attached to the bound framebuffer is a feedback loop.
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 
     // Step 2: HW motion estimation (Adreno accelerated!)
     ctx.glTexEstimateMotion(ctx.prevLumaTex, ctx.currLumaTex, ctx.motionVecBlockTex);
@@ -1074,7 +1376,7 @@ static void applyMobFGSRPrepare(AFMEContext& ctx) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx.motionVecBlockTex);
     glUniform1i(glGetUniformLocation(ctx.mvUpsampleProg, "blockMV"), 0);
-    glBindImageTexture(0, ctx.motionVecTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+    glBindImageTexture(0, ctx.motionVecTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glUniform2i(glGetUniformLocation(ctx.mvUpsampleProg, "renderSize"), w, h);
     glUniform2i(glGetUniformLocation(ctx.mvUpsampleProg, "blockSize"),
                 ctx.motionBlockX, ctx.motionBlockY);
@@ -1088,10 +1390,42 @@ static void applyMobFGSRPrepare(AFMEContext& ctx) {
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, ctx.motionVecTex);
     glBindImageTexture(0, ctx.dilatedDepthTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(1, ctx.dilatedMVTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
+    glBindImageTexture(1, ctx.dilatedMVTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glUniform2i(glGetUniformLocation(ctx.dilateProg, "renderSize"), w, h);
     glDispatchCompute(gx, gy, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    // Step 6: HUD mask accumulation on the block grid (cheap: ~w/8 × h/8
+    // invocations). Reads prev-luma vs curr-luma + the just-estimated block
+    // MVs, so it sees exactly what motion estimation saw this frame.
+    {
+        uint32_t mvW = w / ctx.motionBlockX;
+        uint32_t mvH = h / ctx.motionBlockY;
+        if (mvW == 0 || mvH == 0) return;
+        int bgx = (int)((mvW + 7) / 8);
+        int bgy = (int)((mvH + 7) / 8);
+
+        glUseProgram(ctx.hudMaskProg);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, ctx.currLumaTex);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, ctx.prevLumaTex);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, ctx.motionVecBlockTex);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, ctx.prevHudMaskTex);
+        glBindImageTexture(0, ctx.hudMaskTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
+        glUniform2i(glGetUniformLocation(ctx.hudMaskProg, "lumaSize"), (GLint)w, (GLint)h);
+        glUniform2i(glGetUniformLocation(ctx.hudMaskProg, "blockSize"),
+                    ctx.motionBlockX, ctx.motionBlockY);
+        // Slightly above the VRS 2x2 luma noise floor.
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "lumaThr"), 6.0f / 255.0f);
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "mvThr"), 1.25f); // px
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "upRate"), 0.10f);
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "downRate"), 0.50f);
+        glDispatchCompute(bgx, bgy, 1);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
 }
 
 // MobFGSR stage 2 — per-GENERATED-frame warp for one interpolation position.
@@ -1149,11 +1483,19 @@ static void applyMobFGSRWarp(AFMEContext& ctx, float delta) {
     glBindTexture(GL_TEXTURE_2D, ctx.dilatedMVTex);
     glActiveTexture(GL_TEXTURE6);
     glBindTexture(GL_TEXTURE_2D, ctx.prevDilatedMVTex);
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, ctx.hudMaskTex);   // fresh mask from prepare
     glBindImageTexture(0, ctx.fgResultTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glUniform2i(glGetUniformLocation(ctx.warpProg, "renderSize"), w, h);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "delta"), delta);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "depthThreshold"), 0.004f);
     glUniform1f(glGetUniformLocation(ctx.warpProg, "colorThreshold"), 0.01f);
+    glUniform1f(glGetUniformLocation(ctx.warpProg, "hudStrength"),
+                gHudMaskEnabled.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
+    glUniform1f(glGetUniformLocation(ctx.warpProg, "holeAnchor"),
+                gAntiGhostEnabled.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
+    glUniform1f(glGetUniformLocation(ctx.warpProg, "ghostStrength"),
+                gAntiGhostEnabled.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
     glDispatchCompute(gx, gy, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 }
@@ -1165,6 +1507,7 @@ static void swapMobFGSRBuffers(AFMEContext& ctx) {
     std::swap(ctx.prevMotionVecTex, ctx.motionVecTex);
     std::swap(ctx.prevDilatedDepthTex, ctx.dilatedDepthTex);
     std::swap(ctx.prevDilatedMVTex, ctx.dilatedMVTex);
+    std::swap(ctx.prevHudMaskTex, ctx.hudMaskTex);
 }
 
 // ─── AHB Image Creation ────────────────────────────────────────────────────
@@ -1500,8 +1843,9 @@ static bool initAFMEContext(AFMEContext& ctx) {
             }
         }
 
-        // MobFGSR: motion-vector based interpolation
-        if (gSgsrMode.load() >= 3) {
+        // MobFGSR: motion-vector based interpolation (method=1)
+        if (wantMotionMethod()) {
+            ctx.mobfgsrAttempted = true;
             initMobFGSR(ctx);
         }
 
@@ -1513,6 +1857,20 @@ static bool initAFMEContext(AFMEContext& ctx) {
         }
     }
 
+    // Vsync-grid calibration: ask the display pipeline for the TRUE refresh
+    // cycle instead of trusting the staged prop (the EGL equivalent is
+    // eglGetCompositorTimingANDROID — this is the Vulkan path).
+    if (ctx.hasDisplayTiming && next_vkGetRefreshCycleDurationGOOGLE) {
+        VkRefreshCycleDurationGOOGLE dur = {};
+        if (next_vkGetRefreshCycleDurationGOOGLE(ctx.device, ctx.swapchain, &dur)
+                == VK_SUCCESS) {
+            ctx.refreshCycleNs = dur.refreshDuration;
+            ALOGI("AFME: Measured panel refresh cycle %llu ns (~%d Hz, prop Hz=%d)",
+                  (unsigned long long)ctx.refreshCycleNs, effectiveHz(ctx),
+                  gDisplayHz.load());
+        }
+    }
+
     ctx.initialized = true;
     ALOGI("AFME: Context initialized (%ux%u, %d synth frames for %dx, %u sems, "
           "sgsr=%d, mobfgsr=%d, nativeFence=%d, displayTiming=%d)",
@@ -1520,6 +1878,56 @@ static bool initAFMEContext(AFMEContext& ctx) {
           ctx.mobfgsrInitialized ? 1 : 0, ctx.hasNativeFenceSync ? 1 : 0,
           ctx.hasDisplayTiming ? 1 : 0);
     return true;
+}
+
+// ─── Engagement gate ────────────────────────────────────────────────────────
+//
+// Both AFME layers are armed for the target package, because which graphics API
+// a game actually presents with is not knowable before it runs. So this layer
+// gets loaded even into GLES games — and there the only Vulkan swapchain in the
+// process belongs to HWUI, drawing the Activity's view hierarchy behind the
+// game's SurfaceView. Accelerating that would be pure waste: GPU time spent
+// generating duplicates of a near-static window, extra presents on it, and a
+// second context reporting into the AFME-STATS channel the overlay reads.
+//
+// The discriminator is behavioural: a game render loop presents continuously,
+// a UI window presents only when something changes. Requiring a sustained
+// present interval under kEngageMaxIntervalMs across kEngageRunFrames separates
+// them without needing to recognise engines. Thread identity would be the
+// obvious alternative and is NOT usable — Unreal Engine also names its render
+// thread "RenderThread", exactly like HWUI.
+//
+// A loading screen presenting slowly just delays engagement, which is the
+// behaviour we want anyway. Residual exposure: a long, smooth animation in the
+// game's own Activity window could engage it; for a fullscreen SurfaceView game
+// that window is static, so this has not been observed.
+static constexpr float kEngageMaxIntervalMs = 50.0f;  // 20fps floor
+static constexpr int   kEngageRunFrames = 24;
+
+static bool engagementCheck(AFMEContext& ctx, int64_t nowNs) {
+    if (ctx.engaged) return true;
+
+    if (ctx.engageLastNs > 0) {
+        float ms = (float)(nowNs - ctx.engageLastNs) / 1e6f;
+        if (ms > 0.05f && ms < kEngageMaxIntervalMs) {
+            ctx.engageRun++;
+            ctx.engageEmaMs = (ctx.engageEmaMs <= 0.0f)
+                                  ? ms : ctx.engageEmaMs * 0.8f + ms * 0.2f;
+        } else {
+            ctx.engageRun = 0;
+            ctx.engageEmaMs = 0.0f;
+        }
+    }
+    ctx.engageLastNs = nowNs;
+
+    if (ctx.engageRun >= kEngageRunFrames) {
+        ctx.engaged = true;
+        ALOGI("AFME: engaged on %ux%u swapchain (%.1ffps sustained over %d frames)",
+              ctx.extent.width, ctx.extent.height,
+              ctx.engageEmaMs > 0.0f ? 1000.0f / ctx.engageEmaMs : 0.0f,
+              ctx.engageRun);
+    }
+    return ctx.engaged;
 }
 
 // ─── Vulkan Hooks ───────────────────────────────────────────────────────────
@@ -1558,7 +1966,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateInstance(
                      &next_vkEnumerateDeviceExtensionProperties);
 
     checkProperties();
-    ALOGI("AFME VK Layer v5: Instance created (enabled=%d multiplier=%dx)",
+    ALOGI("AFME VK Layer v8: Instance created (enabled=%d multiplier=%dx)",
           gEnabled.load(), gMultiplier.load());
     return VK_SUCCESS;
 }
@@ -1705,6 +2113,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateDevice(
         if (!next_vkGetFenceFdKHR || !next_vkImportSemaphoreFdKHR)
             hasNativeFence = false;
     }
+    if (hasGoogleTiming) {
+        initDeviceFunc(*pDevice, "vkGetRefreshCycleDurationGOOGLE",
+                       &next_vkGetRefreshCycleDurationGOOGLE);
+    }
 
     {
         std::lock_guard<std::mutex> lock(gLock);
@@ -1716,7 +2128,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateDevice(
         }
     }
 
-    ALOGI("AFME VK Layer v5: Device created");
+    ALOGI("AFME VK Layer v8: Device created");
     return VK_SUCCESS;
 }
 
@@ -1771,6 +2183,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateSwapchainKHR(
     }
     modifiedInfo.minImageCount = requestedCount;
     modifiedInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    // Frame generation requires FIFO: MAILBOX/IMMEDIATE overwrite the pending
+    // buffer before latch, so synthetic frames would be discarded while the
+    // stats still count them (bug E from the 2026-07-28 analysis — generation
+    // "working" invisibly). FIFO keeps every present a definite vsync occupant.
+    if (gEnabled.load(std::memory_order_relaxed) &&
+        modifiedInfo.presentMode != VK_PRESENT_MODE_FIFO_KHR) {
+        ALOGI("AFME: Forcing presentMode FIFO (was %d) — synth frames need "
+              "reliable vsync latching", (int)pCreateInfo->presentMode);
+        modifiedInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    }
 
     ALOGI("AFME: CreateSwapchain %ux%u images %u→%u (for %dx)",
           pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
@@ -1879,6 +2302,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
     AFMEContext& ctx = *ctxPtr;
 
+    // ── Engagement gate ─────────────────────────────────────────────────
+    // Runs before the lazy resource init below, so a swapchain we never
+    // accelerate costs nothing but this counter.
+    {
+        struct timespec tsGate;
+        clock_gettime(CLOCK_MONOTONIC, &tsGate);
+        int64_t gateNs = (int64_t)tsGate.tv_sec * 1000000000LL + tsGate.tv_nsec;
+        if (!engagementCheck(ctx, gateNs)) {
+            return next_vkQueuePresentKHR(queue, pPresentInfo);
+        }
+    }
+
     // Dynamic synth frame reallocation: if user increased multiplier
     // mid-game (e.g. 2x→3x), allocate the missing synth frames now.
     if (mult > ctx.allocatedMult && ctx.initialized) {
@@ -1908,6 +2343,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         if (!initAFMEContext(ctx)) {
             ALOGW("AFME: Init failed, passthrough");
             return next_vkQueuePresentKHR(queue, pPresentInfo);
+        }
+    }
+
+    // Re-calibrate the vsync grid occasionally — the panel can switch modes
+    // mid-session (dynamic refresh, Battery Saver vote down, etc.)
+    if (ctx.hasDisplayTiming && next_vkGetRefreshCycleDurationGOOGLE &&
+        (fc % 600) == 599) {
+        VkRefreshCycleDurationGOOGLE dur = {};
+        if (next_vkGetRefreshCycleDurationGOOGLE(ctx.device, ctx.swapchain, &dur)
+                == VK_SUCCESS &&
+            dur.refreshDuration != ctx.refreshCycleNs) {
+            // Hysteresis: the driver reports ±few-ns jitter per query — a
+            // 2ns "change" at 8.3ms is noise, not a mode switch, and logging
+            // it spammed logcat every 10s on device. Adopt only ≥0.1% deltas.
+            double oldNs = (double)ctx.refreshCycleNs;
+            double dAbs = (double)dur.refreshDuration - oldNs;
+            if (dAbs < 0.0) dAbs = -dAbs;
+            double rel = (oldNs > 0.0) ? dAbs / oldNs : 1.0;
+            if (rel >= 0.001) {
+                ALOGI("AFME: Panel refresh cycle changed %llu → %llu ns (~%d Hz)",
+                      (unsigned long long)ctx.refreshCycleNs,
+                      (unsigned long long)dur.refreshDuration,
+                      (int)(1000000000.0 / (double)dur.refreshDuration + 0.5));
+                ctx.refreshCycleNs = dur.refreshDuration;
+            }
         }
     }
 
@@ -1968,6 +2428,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     }
     ctx.lastPresentNs = nowNs;
 
+    // ── Spacing governor ─────────────────────────────────────────────
+    // A spacing sleep takes wall-clock time from the game thread. That is
+    // free when the game is capped below the panel — the usual frame-gen
+    // case, where its own limiter simply sleeps less — and expensive when
+    // the game is work-bound, where it directly costs real frames. Both
+    // look identical in any single measurement (a 30fps cap and a 30fps
+    // GPU limit have the same frame interval), so instead of trying to
+    // classify, regulate on the quantity we must not damage: the real
+    // frame rate. If spacing is free the scale walks to 1; the moment it
+    // starts costing frames it retreats.
+    if (ctx.emaFrameMs > 0.0f) {
+        float realFps = 1000.0f / ctx.emaFrameMs;
+        // Decay the reference so a genuine scene-complexity drop
+        // re-baselines instead of pinning the scale at zero forever.
+        ctx.bestRealFps = (realFps > ctx.bestRealFps)
+                              ? realFps : ctx.bestRealFps * 0.999f;
+        if (ctx.bestRealFps > 1.0f && realFps < ctx.bestRealFps * 0.94f) {
+            ctx.spacingScale -= 0.08f;   // back off fast: we are costing frames
+        } else {
+            ctx.spacingScale += 0.02f;   // creep up: 50 frames to full
+        }
+        if (ctx.spacingScale < 0.0f) ctx.spacingScale = 0.0f;
+        if (ctx.spacingScale > 1.0f) ctx.spacingScale = 1.0f;
+    }
+
     // Capability: how fast the game could run if we never slept it.
     // work = time since the previous present RETURNED (i.e. excludes our
     // limiter sleep). This is what the tier choice must be based on —
@@ -1992,18 +2477,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     ctx.paceable = false;
     {
         float capFps = (ctx.emaWorkMs > 0.1f) ? 1000.0f / ctx.emaWorkMs : 0.0f;
-        int hz = gDisplayHz.load(std::memory_order_relaxed);
+        int hz = effectiveHz(ctx);
         if (capFps > 1.0f) {
             int chosen = -1;
             for (int n = 0; n <= mult - 1; n++) {
                 float base = (float)hz / (float)(n + 1);
                 if (capFps >= base * 1.02f) { chosen = n; break; }
             }
+            if (chosen < 0) {
+                // No tier is fully sustainable — but a FRAME-RATE-CAPPED game
+                // still belongs on the panel grid: the limiter locks it to the
+                // chosen tier's base rate and total presents == displayHz.
+                // Snap to the FIRST (highest-base) tier whose base is within
+                // 15% pull-out margin of the measured capability.
+                //   60fps-cap on 120Hz → n=1 (60+60), not n=3 (forced down to 30)
+                //   30fps-cap on 120Hz → n=3 (30+90), the classic 4x case
+                // The previous best-effort fallback mapped a flickering
+                // capFps±1fps around a tier boundary onto DIFFERENT gen counts
+                // every few frames (measured: total oscillated 120↔60↔85 on a
+                // steady 30fps game — generation "worked" but was invisible).
+                for (int n = 0; n <= mult - 1; n++) {
+                    float base = (float)hz / (float)(n + 1);
+                    if (capFps >= base * 0.85f) { chosen = n; break; }
+                }
+            }
             if (chosen >= 0) {
                 ctx.paceable = true;
                 numGenFrames = chosen;
             } else {
-                // Best effort: max generation that still fits the panel
+                // Genuinely slower than even the deepest tier's reach:
+                // best-effort generation at whatever still fits the panel.
                 int slots = (int)(((float)hz * 1.02f) / capFps);
                 int maxGen = slots - 1;
                 if (maxGen < 0) maxGen = 0;
@@ -2040,8 +2543,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
     if (numGenFrames == 0) {
         // Game already fills the panel by itself: stay out of the way.
+        // NOTE: do NOT reset ctx.stableGen here — transient no-headroom
+        // windows (a skipped frame, a hitch) used to wipe the committed tier
+        // and the next non-zero window re-committed whatever the noisy
+        // capability said that instant, feeding the gen-count oscillation.
         ctx.hasPrevFrame = false;
-        ctx.stableGen = -1;
         ctx.nextDeadlineNs = 0;
         ctx.lastReturnNs = nowNs;  // passthrough adds no work of its own
         if ((fc % 300) == 0) {
@@ -2055,7 +2561,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     VkImage swapImg = ctx.swapchainImages[presentIdx];
 
     const int sgsrMode = gSgsrMode.load();
-    const bool interpolation = (sgsrMode == 3 && ctx.mobfgsrInitialized);
+    // The motion method interpolates, so it must hold the real frame back until
+    // the synthetic one is ready; extrapolation presents the real frame first.
+    // Falls back to extrapolation if MobFGSR could not be built for this ctx.
+    const bool interpolation = (wantMotionMethod() && ctx.mobfgsrInitialized);
+    // Visibility for a silent downgrade: a failed MobFGSR build used to look
+    // identical in logcat to interpolation working. One WARN per 300 frames.
+    if (wantMotionMethod() && !ctx.mobfgsrInitialized && ctx.mobfgsrAttempted
+        && (fc % 300) == 0) {
+        ALOGW("AFME: method=motion requested but MobFGSR unavailable for this "
+              "swapchain — falling back to extrapolation (see init errors above)");
+    }
     const bool generate = ctx.hasPrevFrame;
 
     // Step 1: Copy swapchain → currFrame (Vulkan blit). Waits the game's
@@ -2083,7 +2599,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &cmd;
-        submitInfo.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+        // Clamp to the fixed stage array: a game presenting with >8 wait
+        // semaphores would otherwise exceed waitStages' declared bounds.
+        if (pPresentInfo->waitSemaphoreCount > 8) {
+            ALOGW("AFME: game presented with %u wait semaphores — clamping to 8",
+                  pPresentInfo->waitSemaphoreCount);
+        }
+        submitInfo.waitSemaphoreCount =
+            (pPresentInfo->waitSemaphoreCount > 8) ? 8 : pPresentInfo->waitSemaphoreCount;
         submitInfo.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
         VkPipelineStageFlags waitStages[8] = {};
         for (uint32_t i = 0; i < pPresentInfo->waitSemaphoreCount && i < 8; i++)
@@ -2123,6 +2646,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         realPresent.pImageIndices = &presentIdx;
         realPresent.pResults = pPresentInfo->pResults;
         finalResult = next_vkQueuePresentKHR(queue, &realPresent);
+
+        // Anchor for spacing the synthetic frames that follow.
+        struct timespec tsReal;
+        clock_gettime(CLOCK_MONOTONIC, &tsReal);
+        ctx.realPresentNs = (int64_t)tsReal.tv_sec * 1000000000LL + tsReal.tv_nsec;
     }
 
     // Step 2b: Generate synth frames (both modes)
@@ -2169,6 +2697,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             }
         }
 
+        // The method property can flip mid-session (GameSpace writes it while
+        // the game runs), but MobFGSR is otherwise only built at swapchain
+        // creation — so selecting "motion" on a running game used to silently
+        // keep extrapolating. Build it on first use instead. AFME's EGL
+        // context is current here, which is what initMobFGSR requires.
+        if (wantMotionMethod() && !ctx.mobfgsrInitialized && !ctx.mobfgsrAttempted) {
+            ctx.mobfgsrAttempted = true;
+            ALOGI("AFME: method=motion selected at runtime — building MobFGSR");
+            initMobFGSR(ctx);
+        }
+
         // Determine frame generation source textures
         // If SGSR1 is enabled, apply sharpening to currFrame first
         GLuint srcPrevTex = ctx.prevFrame.glTex;
@@ -2188,7 +2727,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
         float userFactor = gFactorOverride.load();  // 0 = auto
         for (int i = 0; i < numGenFrames; i++) {
-            float autoFactor = (float)(i + 1) / (float)mult;
+            // Divide by the ACTUAL number of presents per interval
+            // (numGenFrames+1), not the requested multiplier. With the tier
+            // clamp reducing generation below mult-1, /mult placed synth
+            // frames at the wrong temporal phase (measured: 1 gen at 4x
+            // produced factor=0.25 — quarter-phase motion displayed in the
+            // half-phase slot, the interpolation was literally half-strength).
+            float autoFactor = (float)(i + 1) / (float)(numGenFrames + 1);
             float factor = (userFactor > 0.0f) ? autoFactor * userFactor : autoFactor;
 
             if (interpolation) {
@@ -2211,8 +2756,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             }
 
             if ((fc % 300) == 0 && i == 0) {
-                ALOGI("AFME: Gen frame %d/%d factor=%.2f mode=%d (frame %lu, %dx)",
-                      i+1, numGenFrames, factor, sgsrMode, (unsigned long)fc, mult);
+                ALOGI("AFME: Gen frame %d/%d factor=%.2f method=%s sgsr=%d "
+                      "(frame %lu, %dx)",
+                      i+1, numGenFrames, factor,
+                      interpolation ? "motion" : "extrapolate", sgsrMode,
+                      (unsigned long)fc, mult);
             }
         }
 
@@ -2259,6 +2807,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
         // Present the synth frames. The LAST copy submit signals drainFence —
         // next frame's drain point.
+        //
+        // Interpolation mode anchor: the real frame is presented AFTER the
+        // synths, so the anchor used by the spacing sleep must be relative to
+        // the START of the synth emission — otherwise ctx.realPresentNs stays
+        // 0 and the spacing path is silently dead for method=1 (bug D).
+        if (interpolation) {
+            struct timespec tsAnchor;
+            clock_gettime(CLOCK_MONOTONIC, &tsAnchor);
+            ctx.realPresentNs = (int64_t)tsAnchor.tv_sec * 1000000000LL
+                                + tsAnchor.tv_nsec;
+        }
         for (int i = 0; i < numGenFrames; i++) {
             VkSemaphore acquireSem = ctx.acquireSem();
             if (acquireSem == VK_NULL_HANDLE) {
@@ -2327,15 +2886,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             // in the very next vsync slot after the real frame — measured
             // present2present is bimodal 8ms / 16-24ms, which strobes.
             // Schedule it at its temporal position inside the game-frame
-            // interval (extrapolation: (i+1)/mult of the interval AFTER the
+            // interval ((i+1)/(numGenFrames+1) of the interval AFTER the
             // real frame), minus ~half a 120Hz vsync so SurfaceFlinger's
             // latch quantization rounds to the nearest slot.
+            //
+            // NOTE: on bp4a/onyx SurfaceFlinger was measured to DROP >50% of
+            // delayed synth buffers instead of holding them — the spacing
+            // sleep below is the mechanism that works here; this stamp stays
+            // opt-in via persist.sys.afme.pacing for future SF releases.
             VkPresentTimeGOOGLE presentTime = {};
             VkPresentTimesInfoGOOGLE timesInfo = {};
-            if (!interpolation && gPacingEnabled.load(std::memory_order_relaxed) &&
+            if (gPacingEnabled.load(std::memory_order_relaxed) &&
                 ctx.hasDisplayTiming && ctx.emaFrameMs > 0.0f) {
                 int64_t offsetNs = (int64_t)(ctx.emaFrameMs * 1e6f *
-                                             (float)(i + 1) / (float)mult)
+                                             (float)(i + 1) / (float)(numGenFrames + 1))
                                    - 4000000LL;
                 if (offsetNs < 0) offsetNs = 0;
                 presentTime.presentID = ++ctx.presentId;
@@ -2344,6 +2908,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
                 timesInfo.swapchainCount = 1;
                 timesInfo.pTimes = &presentTime;
                 genPresent.pNext = &timesInfo;
+            }
+
+            // Hold this synthetic frame until its temporal slot inside the
+            // game's frame interval. Presenting it now would land it in the
+            // vsync immediately after the real frame, which is what makes
+            // generation invisible: the real frame gets one vsync of screen
+            // time and the synthetic one gets the rest.
+            //
+            // Scaled by the governor, so if the sleep turns out to cost the
+            // game real frames this decays to a no-op on its own.
+            if (gSpacingEnabled.load(std::memory_order_relaxed) &&
+                ctx.spacingScale > 0.01f && ctx.emaFrameMs > 0.0f &&
+                ctx.realPresentNs > 0) {
+                int64_t intervalNs = (int64_t)(ctx.emaFrameMs * 1e6f);
+                int64_t slotNs = intervalNs / (int64_t)(numGenFrames + 1);
+                int64_t offsetNs = (int64_t)((float)(slotNs * (int64_t)(i + 1))
+                                             * ctx.spacingScale);
+                struct timespec tsNow2;
+                clock_gettime(CLOCK_MONOTONIC, &tsNow2);
+                int64_t curNs = (int64_t)tsNow2.tv_sec * 1000000000LL
+                                + tsNow2.tv_nsec;
+                int64_t sleepNs = (ctx.realPresentNs + offsetNs) - curNs;
+                // Below ~0.3ms nanosleep costs more than it buys; above 50ms
+                // something is wrong with the interval estimate — do not hang
+                // the game thread on it.
+                if (sleepNs > 300000LL && sleepNs < 50000000LL) {
+                    struct timespec req = { (time_t)(sleepNs / 1000000000LL),
+                                            (long)(sleepNs % 1000000000LL) };
+                    nanosleep(&req, nullptr);
+                }
             }
 
             next_vkQueuePresentKHR(queue, &genPresent);
@@ -2437,8 +3031,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
 
     if (gLimiterEnabled.load(std::memory_order_relaxed) && numGenFrames > 0 &&
         ctx.paceable) {
-        int64_t vsyncNs = 1000000000LL /
-            (int64_t)gDisplayHz.load(std::memory_order_relaxed);
+        // Prefer the measured vsync period; fall back to inverting the prop.
+        int64_t vsyncNs = (ctx.refreshCycleNs >= 2000000 &&
+                           ctx.refreshCycleNs <= 100000000)
+                              ? (int64_t)ctx.refreshCycleNs
+                              : 1000000000LL / (int64_t)gDisplayHz.load(std::memory_order_relaxed);
         int64_t targetNs = (int64_t)(numGenFrames + 1) * vsyncNs;
         if (ctx.nextDeadlineNs <= 0) {
             ctx.nextDeadlineNs = endNs + targetNs;

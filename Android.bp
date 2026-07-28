@@ -10,7 +10,7 @@
 
 cc_library_shared {
     name: "libAFME_layer",
-    vendor: true,
+    system_ext_specific: true,
 
     srcs: ["afme_layer.cpp"],
 
@@ -35,18 +35,21 @@ cc_library_shared {
 
     ldflags: ["-Wl,--no-undefined"],
 
-    relative_install_path: "egl",
+    // Discovered by egl_layers.cpp's kAfmeLayerLibraryDir, which is searched when
+    // persist.sys.afme.enable is set. Must live outside the app's own directories so
+    // the EGL loader opens it in the platform linker namespace — it needs libcutils,
+    // which app namespaces do not expose.
+    relative_install_path: "afme",
 }
 
 // AFME Vulkan Layer — intercepts vkQueuePresentKHR for frame generation
 // RE'd interface from libVkLayer_ADRENO_qprofiler.so + AOSP loader source
-// File MUST start with "libVkLayer" (layers_extensions.cpp line 435)
-// Layer name: VK_LAYER_AFME_frame_gen (set via gpu_debug_layers)
-// Search path: /data/local/debug/vulkan/ (layers_extensions.cpp line 67)
+// File MUST start with "libVkLayer" (DiscoverLayersInPathList filters on that)
+// Layer name: VK_LAYER_AFME_frame_gen (named via setDebugLayers)
 
 cc_library_shared {
     name: "libVkLayer_AFME",
-    vendor: true,
+    system_ext_specific: true,
 
     srcs: ["afme_vk_layer.cpp"],
 
@@ -74,6 +77,9 @@ cc_library_shared {
 
     ldflags: ["-Wl,--no-undefined"],
 
-    // Install to /vendor/lib64/egl/ (same as ADRENO_qprofiler)
-    relative_install_path: "egl",
+    // Discovered by layers_extensions.cpp's kAfmeLayerLibraryDir, which is searched
+    // when persist.sys.afme.enable is set. Must live outside the app's own directories
+    // so the Vulkan loader opens it in the platform linker namespace — it needs
+    // libcutils and libc++, which app namespaces do not expose.
+    relative_install_path: "afme",
 }
