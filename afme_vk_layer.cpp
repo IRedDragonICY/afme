@@ -300,6 +300,7 @@ static void initFilterGl() {
         gFilterGl.GetUniformLocation = glGetUniformLocation;
         gFilterGl.Uniform1i = glUniform1i;
         gFilterGl.Uniform4f = glUniform4f;
+        gFilterGl.Uniform1f = glUniform1f;
         gFilterGl.GenFramebuffers = glGenFramebuffers;
         gFilterGl.DeleteFramebuffers = glDeleteFramebuffers;
         gFilterGl.BindFramebuffer = glBindFramebuffer;
@@ -2308,8 +2309,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     const bool fgOn = afme::config().fg.load(std::memory_order_relaxed);
     const int numGenFrames = fgOn ? tier.numGen : 0;
 
-    const afme::FilterParams fp = afme::filterParams();
-    bool filterOn = afme::filterEnabled() && !fp.isIdentity() &&
+    const afme::FilterStack fp = afme::filterStack();
+    bool filterOn = afme::filterEnabled() && !fp.empty() &&
                     !ctx.filterUnsupported && !ctx.filter.failed();
     if (filterOn && !is8BitSwapchain(ctx.format)) {
         ALOGW("AFME: color filter disabled — swapchain format %d is not 8-bit, "
@@ -2330,7 +2331,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     // Stage B holds the screen-space effects — vignette, grain, letterbox —
     // which must run AFTER generation on every present, or the motion field
     // would warp them off the screen and the grain would be read as motion.
-    bool stageB = filterOn && fp.hasStageB();
+    bool stageB = filterOn && fp.hasScreenSpace();
     if (stageB && !ctx.presentFrame.valid) {
         if (!createAHBImage(ctx, ctx.presentFrame, ctx.extent.width,
                             ctx.extent.height)) {

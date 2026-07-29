@@ -478,6 +478,7 @@ void initFilterGl() {
     sFilterGl.GetUniformLocation = sGL.GetUniformLocation;
     sFilterGl.Uniform1i = sGL.Uniform1i;
     sFilterGl.Uniform4f = sGL.Uniform4f;
+    sFilterGl.Uniform1f = sGL.Uniform1f;
     sFilterGl.GenFramebuffers = sGL.GenFramebuffers;
     sFilterGl.DeleteFramebuffers = sGL.DeleteFramebuffers;
     sFilterGl.BindFramebuffer = sGL.BindFramebuffer;
@@ -995,12 +996,12 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     const bool fgOn = afme::config().fg.load(std::memory_order_relaxed);
     const int numGenFrames = fgOn ? tier.numGen : 0;
 
-    const afme::FilterParams fp = afme::filterParams();
-    const bool filterOn = afme::filterEnabled() && !fp.isIdentity() &&
+    const afme::FilterStack fp = afme::filterStack();
+    const bool filterOn = afme::filterEnabled() && !fp.empty() &&
                           !state->filter.failed();
     // Screen-space effects must run AFTER generation on every present, or the
     // motion field warps them off the screen and the grain is read as motion.
-    bool stageB = filterOn && fp.hasStageB();
+    bool stageB = filterOn && fp.hasScreenSpace();
 
     if (numGenFrames == 0 && !filterOn) {
         // Nothing to do: the game already fills the panel and no grade is set.

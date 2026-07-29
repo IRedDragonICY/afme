@@ -69,74 +69,69 @@ namespace afme {
 
 // ─── Parameters ─────────────────────────────────────────────────────────────
 
+/** Filter kinds, ordinals shared with GameSpace's FilterKind enum. */
+enum FilterKind {
+    kExposure    = 0,
+    kColor       = 1,
+    kDetails     = 2,
+    kLevels      = 3,
+    kBlackWhite  = 4,
+    kSepia       = 5,
+    kColorBlind  = 6,
+    // Splitscreen belongs to stage A even though it is screen-space: it
+    // compares against the UNFILTERED frame, and only stage A still has it.
+    kSplitscreen = 7,
+    kVignette    = 8,   // true screen space from here down
+    kFilmGrain   = 9,
+    kLetterbox   = 10,
+    kKindCount   = 11,
+};
+
+/** Screen-space kinds must run AFTER generation — see the header comment. */
+inline bool isScreenSpace(int kind) { return kind >= kVignette; }
+
+/** One filter in the stack. */
+struct FilterNode {
+    int   kind = -1;
+    float p[6] = {0, 0, 0, 0, 0, 0};
+};
+
 /**
- * One complete look. Defaults are the identity — a freshly constructed
- * FilterParams changes nothing, and isIdentity() reports it so the caller can
- * skip everything.
+ * An ordered stack, evaluated in sequence.
+ *
+ * Order is real: Color-then-Details and Details-then-Color produce different
+ * pictures, exactly as they do in Freestyle. The one imposed constraint is that
+ * screen-space nodes are pulled out into stage B regardless of where the user
+ * put them, because they cannot survive frame generation; relative order within
+ * each stage is preserved.
  */
-struct FilterParams {
-    // ── Stage A: tone ──
-    float exposure   = 0.0f;   // stops, applied as exp2()
-    float brightness = 0.0f;
-    float contrast   = 1.0f;   // around 0.5 pivot
-    float gamma      = 1.0f;
-    float black      = 0.0f;
-    float white      = 1.0f;
-    float shadows    = 0.0f;   // -1..1, luma-masked lift
-    float highlights = 0.0f;   // -1..1, luma-masked gain
+struct FilterStack {
+    static constexpr int kMaxNodes = 8;
 
-    // ── Stage A: color ──
-    float saturation  = 1.0f;
-    float vibrance    = 0.0f;
-    float temperature = 0.0f;  // -1 cool .. +1 warm
-    float tint        = 0.0f;  // -1 green .. +1 magenta
-    float hue         = 0.0f;  // radians about the grey axis
-    float mono        = 0.0f;
-    float sepia       = 0.0f;
-    float intensity   = 1.0f;  // master wet/dry against the original
+    FilterNode nodes[kMaxNodes];
+    int count = 0;
 
-    // ── Stage A: detail and range ──
-    float sharpen         = 0.0f;  // 0..1, contrast-adaptive
-    float clarity         = 0.0f;  // -1..1, local contrast (wide unsharp mask)
-    float bloom           = 0.0f;  // 0..1 intensity
-    float bloomThreshold  = 0.75f; // luminance where bloom starts
-    float hdrToning       = 0.0f;  // 0..1 blend toward an ACES-style tonemap
+    /** Nothing to apply at all. */
+    bool empty() const { return count == 0; }
 
-    // ── Stage B: screen space ──
-    float vignette  = 0.0f;   // 0..1 strength
-    float grain     = 0.0f;   // 0..1 amount
-    float letterbox = 0.0f;   // 0..0.25, fraction of height masked each side
+    /** Any node that has to run after generation. */
+    bool hasScreenSpace() const;
 
-    // ── Accessibility / utility ──
-    int   cbMode     = 0;      // 0 off, 1 protan, 2 deutan, 3 tritan
-    float cbStrength = 0.0f;
-    float split      = -1.0f;  // <0 off; compare divider in 0..1
-
-    /** True when applying this would be a no-op. */
-    bool isIdentity() const;
-
-    /** Any effect that must run AFTER generation. */
-    bool hasStageB() const;
-
-    /** Any stage A effect that needs the downsampled scene chain. */
+    /** Any stage-A node needing the downsampled scene chain (clarity/bloom). */
     bool needsMips() const;
 };
 
 /**
- * Read the filter properties. Grouped rather than one-per-value because
- * PROPERTY_VALUE_MAX is 92 bytes and persist.* properties get no exemption:
+ * Read the filter properties.
+ *
+ * One property per stack slot, because PROPERTY_VALUE_MAX is 92 bytes and
+ * persist.* gets no exemption — a whole stack would never fit in one:
  *
  *   persist.sys.afme.filter        "0"/"1"
- *   persist.sys.afme.filter.tone   exposure,brightness,contrast,gamma,
- *                                  black,white,shadows,highlights
- *   persist.sys.afme.filter.color  saturation,vibrance,temperature,tint,
- *                                  hue,mono,sepia,intensity
- *   persist.sys.afme.filter.fx     cbMode,cbStrength,split,sharpen,clarity,
- *                                  bloom,bloomThreshold,hdrToning
- *   persist.sys.afme.filter.fx2    vignette,grain,letterbox
+ *   persist.sys.afme.filter.n      node count
+ *   persist.sys.afme.filter.s0..s7 "kind,p0,p1,p2,p3,p4,p5"
  *
- * A torn read across these costs at most one frame of mixed settings. Missing
- * or malformed fields keep their default.
+ * A torn read across slots costs at most one frame of mixed settings.
  */
 void pollFilterProps();
 
@@ -148,16 +143,16 @@ bool filterEnabled();
  *
  * The layers normally poll properties every 64 presents, which is up to ~1.5s —
  * far too laggy to drag a slider against. When set, the caller should re-read
- * the filter properties EVERY present. The property reads are shared-memory
- * lookups costing ~1us total, affordable for the seconds a user spends in the
- * panel, and it reverts to the cheap path when the panel closes.
+ * the filter properties EVERY present. The reads are shared-memory lookups
+ * costing ~1us, affordable for the seconds a user spends in the panel, and it
+ * reverts to the cheap path when the panel closes.
  *
  * Reads a cached atomic, so calling it every present is free.
  */
 bool filterLive();
 
-/** Latest parsed parameters. Safe to call every present. */
-FilterParams filterParams();
+/** Latest parsed stack. Safe to call every present. */
+FilterStack filterStack();
 
 // ─── GL dispatch ────────────────────────────────────────────────────────────
 
@@ -188,6 +183,7 @@ struct FilterGL {
     GLint (*GetUniformLocation)(GLuint, const GLchar*) = nullptr;
     void (*Uniform1i)(GLint, GLint) = nullptr;
     void (*Uniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat) = nullptr;
+    void (*Uniform1f)(GLint, GLfloat) = nullptr;
 
     void (*GenFramebuffers)(GLsizei, GLuint*) = nullptr;
     void (*DeleteFramebuffers)(GLsizei, const GLuint*) = nullptr;
@@ -239,23 +235,23 @@ public:
     bool failed() const { return failed_; }
 
     /**
-     * Stage A: grade + HDR toning + sharpen + clarity + bloom.
+     * Stage A: every non-screen-space node, in stack order.
      *
      * @p srcTex → @p dstTex, both @p w by @p h. Builds and consumes the
      * downsampled scene chain internally when clarity or bloom is active.
      */
     void applyStageA(GLuint srcTex, GLuint dstTex, uint32_t w, uint32_t h,
-                     const FilterParams& p);
+                     const FilterStack& s);
 
     /**
-     * Stage B: vignette + grain + letterbox, @p srcTex → @p dstTex.
+     * Stage B: every screen-space node, in stack order, @p srcTex → @p dstTex.
      *
      * Call once per PRESENT — on the real frame and on each synthetic frame —
      * so screen-space effects stay pinned to the screen instead of being warped
      * by the motion field. @p frameIdx animates the grain.
      */
     void applyStageB(GLuint srcTex, GLuint dstTex, uint32_t w, uint32_t h,
-                     const FilterParams& p, uint64_t frameIdx);
+                     const FilterStack& s, uint64_t frameIdx);
 
 private:
     bool buildMips(uint32_t w, uint32_t h);
@@ -277,10 +273,13 @@ private:
     GLuint bloomTex_ = 0;   // quarter res + mips — bloom source
     uint32_t mipW_ = 0, mipH_ = 0;
 
-    GLint aSrc_ = -1, aScene_ = -1, aBloom_ = -1;
-    GLint aTone1_ = -1, aTone2_ = -1, aColor1_ = -1, aColor2_ = -1;
-    GLint aDetail_ = -1, aMisc_ = -1;
-    GLint bSrc_ = -1, bParams_ = -1;
+    GLint aSrc_ = -1, aScene_ = -1, aBloom_ = -1, aCount_ = -1;
+    GLint aKind_[FilterStack::kMaxNodes] = {};
+    GLint aP0_[FilterStack::kMaxNodes] = {};
+    GLint aP1_[FilterStack::kMaxNodes] = {};
+    GLint bSrc_ = -1, bCount_ = -1, bTime_ = -1;
+    GLint bKind_[FilterStack::kMaxNodes] = {};
+    GLint bP0_[FilterStack::kMaxNodes] = {};
     GLint downSrc_ = -1, brightSrc_ = -1, brightParams_ = -1;
 };
 
