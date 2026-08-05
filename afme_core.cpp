@@ -113,7 +113,6 @@ void Config::poll() {
     if (sgsr >= 0 && sgsr <= 3) sgsrMode.store(sgsr);
 
     spacing.store(propBool("persist.sys.afme.spacing", "1"));
-    pacing.store(propBool("persist.sys.afme.pacing", "0"));
     limiter.store(propBool("persist.sys.afme.limiter", "1"));
     vrsFg.store(propBool("persist.sys.afme.vrs_fg", "1"));
     hudMask.store(propBool("persist.sys.afme.hud_mask", "1"));

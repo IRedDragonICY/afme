@@ -83,8 +83,19 @@ public:
 
     // Cadence
     std::atomic<bool> spacing{true};   // spacing sleeps between synth presents
-    std::atomic<bool> pacing{false};   // desiredPresentTime stamping
     std::atomic<bool> limiter{true};   // Swappy-style base-rate lock
+    //
+    // There is deliberately no desiredPresentTime ("pacing") option here.
+    // VK_GOOGLE_display_timing / eglPresentationTimeANDROID stamping can place
+    // synthetic frames on exact vsync slots, but this SurfaceFlinger DROPS a
+    // buffer stamped for a future vsync instead of holding it. Measured on
+    // onyx/bp4a with a probe against vkGetPastPresentationTimingGOOGLE: 0 of
+    // 240 stamped frames ever reached the display, and end to end it cost 86%
+    // of all frames (213 of 247 dropped, 37.6 displayed fps on a 120Hz panel).
+    // A property that can only do harm is not a setting, it is a trap — the
+    // spacing sleeps below are the mechanism that works here. If a future
+    // SurfaceFlinger honours the stamps this is a small patch to restore; the
+    // measurement method is in the AFME debug playbook.
 
     // Anisotropic-filtering override, in taps: 0 = leave the game alone, else
     // 2/4/8/16 clamped to what the driver reports. Third independent feature

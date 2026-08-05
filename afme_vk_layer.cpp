@@ -439,6 +439,7 @@ struct AFMEContext {
     // VK_GOOGLE_display_timing pacing for synthetic frames
     bool hasDisplayTiming = false;
     uint32_t presentId = 0;
+
     // Measured panel refresh cycle (vkGetRefreshCycleDurationGOOGLE); 0 = use
     // the afme::config().displayHz prop instead. Vsync grid
     // calibration: the panel CAN differ from the staged prop (e.g. Battery
@@ -973,8 +974,7 @@ layout(binding=3) uniform mediump sampler2D r_prev_mask;
 // r32f, NOT r8: ESSL 3.10 only guarantees rgba32f/rgba16f/r32f/rgba8/
 // rgba8_snorm/rgba*ui/r32ui/rgba*i/r32i as image formats. The Adreno compiler
 // rejects r8 ("not a legal layout qualifier id"), which failed the whole of
-// initMobFGSR and silently downgraded method=motion to extrapolation — the
-// interpolation engine never ran once on device.
+// initMobFGSR and silently downgraded method=motion to extrapolation.
 layout(r32f, binding=0) writeonly uniform highp image2D rw_mask;
 uniform ivec2 lumaSize;
 uniform ivec2 blockSize;
@@ -982,10 +982,31 @@ uniform float lumaThr;
 uniform float mvThr;
 uniform float upRate;
 uniform float downRate;
+uniform float worldThr;
 void main() {
     ivec2 blk = ivec2(gl_GlobalInvocationID.xy);
     ivec2 maskSize = imageSize(rw_mask);
     if (any(greaterThanEqual(blk, maskSize))) return;
+
+    // What is the WORLD doing around this block? A HUD element is small next to
+    // this window, so the ring is world content even when the centre is UI.
+    vec2  worldSum = vec2(0.0);
+    float worldMag = 0.0;
+    int   n = 0;
+    for (int dy = -3; dy <= 3; dy += 3) {
+        for (int dx = -3; dx <= 3; dx += 3) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = clamp(blk + ivec2(dx, dy), ivec2(0), maskSize - ivec2(1));
+            vec2 m = texelFetch(r_block_mv, q, 0).xy;
+            worldSum += m;
+            worldMag += length(m);
+            n++;
+        }
+    }
+    worldMag /= float(n);
+    vec2 worldDir = (length(worldSum) > 1e-5) ? normalize(worldSum) : vec2(0.0);
+
+    // What is this block doing?
     ivec2 c = blk * blockSize + blockSize / 2;
     float diff = 0.0;
     for (int dy = -2; dy <= 2; dy += 2) {
@@ -996,11 +1017,43 @@ void main() {
         }
     }
     diff /= 9.0;
-    vec2 mvPx = texelFetch(r_block_mv, blk, 0).xy;
-    bool isStatic = (diff < lumaThr) && (length(mvPx) < mvThr);
-    float prev = texelFetch(r_prev_mask, blk, 0).x;
-    float m = clamp(prev + (isStatic ? upRate : -downRate), 0.0, 1.0);
-    imageStore(rw_mask, blk, vec4(m));
+    vec2  mvPx  = texelFetch(r_block_mv, blk, 0).xy;
+    float mvLen = length(mvPx);
+    float prev  = texelFetch(r_prev_mask, blk, 0).x;
+
+    // "Is UI" is a SLOW, STICKY, SPATIAL property. "Is changing" is a fast
+    // temporal one. The previous version used a single accumulator for both,
+    // and that is precisely why animated HUD ghosted: the score required the
+    // block to be UNCHANGING, so a draining stamina ring, floating damage
+    // numbers, a cooldown sweep and the minimap rotating under a turning camera
+    // all failed the test and released the mask in two frames (-0.50/frame) —
+    // after which world motion vectors warped them. They are the exact elements
+    // users notice.
+    //
+    // The discriminator that actually separates UI from world is not stillness,
+    // it is being SCREEN-LOCKED: UI does not move when the world moves. So
+    // evidence is gathered only while the world is actually in motion, and the
+    // mask is released only by the one thing UI can never do — move WITH the
+    // world.
+    bool worldMoving  = worldMag > worldThr;
+    bool selfStill    = mvLen < mvThr;
+    bool movesWithWorld = worldMoving && mvLen > mvThr &&
+                          dot(mvPx / max(mvLen, 1e-5), worldDir) > 0.7;
+
+    float m = prev;
+    if (movesWithWorld) {
+        m -= downRate;                       // proven world content
+    } else if (worldMoving && selfStill) {
+        // Screen-locked while the world moves. Full credit when the pixels are
+        // also unchanging (static HUD), half credit when they are not — that
+        // half is what keeps ANIMATED HUD masked instead of ghosting.
+        m += (diff < lumaThr) ? upRate : upRate * 0.5;
+    }
+    // Otherwise the frame carries no information about this block (camera
+    // still, whole scene static) — hold the score rather than guess. Costs
+    // nothing: with no motion there is nothing for the warp to get wrong.
+
+    imageStore(rw_mask, blk, vec4(clamp(m, 0.0, 1.0)));
 })";
 
 // Compute shader: Warp + blend interpolation (from MobFGSR Warp_I.comp)
@@ -1365,7 +1418,10 @@ static void applyMobFGSRPrepare(AFMEContext& ctx) {
         glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "lumaThr"), 6.0f / 255.0f);
         glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "mvThr"), 1.25f); // px
         glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "upRate"), 0.10f);
-        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "downRate"), 0.50f);
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "downRate"), 0.34f);
+        // Below this the "world" is not moving enough for stillness to mean
+        // anything, so the frame is treated as carrying no evidence either way.
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "worldThr"), 1.5f);
         glDispatchCompute(bgx, bgy, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     }
@@ -2977,34 +3033,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             genPresent.swapchainCount = 1;
             genPresent.pSwapchains = &swapchain;
             genPresent.pImageIndices = &newIdx;
-
-            // PACING: without a desired present time, this synth frame lands
-            // in the very next vsync slot after the real frame — measured
-            // present2present is bimodal 8ms / 16-24ms, which strobes.
-            // Schedule it at its temporal position inside the game-frame
-            // interval ((i+1)/(numGenFrames+1) of the interval AFTER the
-            // real frame), minus ~half a 120Hz vsync so SurfaceFlinger's
-            // latch quantization rounds to the nearest slot.
-            //
-            // NOTE: on bp4a/onyx SurfaceFlinger was measured to DROP >50% of
-            // delayed synth buffers instead of holding them — the spacing
-            // sleep below is the mechanism that works here; this stamp stays
-            // opt-in via persist.sys.afme.pacing for future SF releases.
-            VkPresentTimeGOOGLE presentTime = {};
-            VkPresentTimesInfoGOOGLE timesInfo = {};
-            if (afme::config().pacing.load(std::memory_order_relaxed) &&
-                ctx.hasDisplayTiming && ctx.pacer.intervalMs() > 0.0f) {
-                int64_t offsetNs = (int64_t)(ctx.pacer.intervalMs() * 1e6f *
-                                             (float)(i + 1) / (float)(numGenFrames + 1))
-                                   - 4000000LL;
-                if (offsetNs < 0) offsetNs = 0;
-                presentTime.presentID = ++ctx.presentId;
-                presentTime.desiredPresentTime = (uint64_t)(nowNs + offsetNs);
-                timesInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
-                timesInfo.swapchainCount = 1;
-                timesInfo.pTimes = &presentTime;
-                genPresent.pNext = &timesInfo;
-            }
 
             // Hold this synthetic frame until its temporal slot inside the
             // game's frame interval. Presenting it now would land it in the

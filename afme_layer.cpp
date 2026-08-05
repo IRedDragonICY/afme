@@ -1164,16 +1164,6 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
             // including on the motion path, so the synths always fill the slots
             // after it.
             state->pacer.spaceSynth(i, numGenFrames, /*realFirst=*/true);
-            if (afme::config().pacing.load(std::memory_order_relaxed) &&
-                    sGL.PresentationTime && state->pacer.intervalMs() > 0.0f) {
-                // Ask SurfaceFlinger to latch THIS buffer at its temporal
-                // slot rather than the next vsync (standard presentation-time placement).
-                int64_t offsetNs = (int64_t)(state->pacer.intervalMs() * 1e6f *
-                                             (float)(i + 1) / (float)(numGenFrames + 1))
-                                   - 3000000LL;
-                if (offsetNs < 0) offsetNs = 0;
-                sGL.PresentationTime(dpy, surface, afme::nowNs() + offsetNs);
-            }
             result = nextSwap(dpy, surface);
             state->stats.addGen();
         }
