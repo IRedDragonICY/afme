@@ -80,8 +80,20 @@ void Config::poll() {
     // Invalid values keep the previous setting rather than snapping to a
     // default: a transiently empty property during a GameSpace write must not
     // drop a running 4x session to 2x for a frame.
+    //
+    // This is also why `fg` exists rather than multiplier==0 meaning off: a
+    // rejected value leaves the LAST GOOD one in force, so writing 0 for "off"
+    // left the layer generating at whatever the previous session chose while
+    // the panel showed Off. Both writers now publish only 2..4 and use `fg`.
     const int m = propInt("persist.sys.afme.multiplier", "2");
     if (m >= 2 && m <= kMaxMultiplier) multiplier.store(m);
+
+    // AF taps. Unlike the multiplier, an unrecognised value here means "off"
+    // rather than "keep": nothing is mid-flight in a sampler, and a bogus value
+    // must not leave every texture in the game overridden.
+    const int afTaps = propInt("persist.sys.afme.af", "0");
+    af.store((afTaps == 2 || afTaps == 4 || afTaps == 8 || afTaps == 16)
+                 ? afTaps : 0);
 
     // Anything unrecognised means extrapolation, which needs no shaders and so
     // can never fail to initialize.
@@ -161,6 +173,13 @@ Pacer::Tier Pacer::selectTier(int mult, int hz) const {
 
     // Smallest sustainable n wins: highest base rate, lowest latency, fewest
     // artifacts, and total presents still fill every vsync slot.
+    //
+    // "Smallest" is not a preference, it is a hard requirement: a deeper tier
+    // has a LOWER base, and the limiter enforces that base by sleeping the
+    // game. Choosing n=3 for a game that free-runs at 56fps drags it down to 30
+    // — the user loses half their real frame rate and all of the input
+    // responsiveness that goes with it, in exchange for synthetic frames. Never
+    // trade real frames for generated ones.
     int chosen = -1;
     for (int n = 0; n <= mult - 1; n++) {
         const float base = (float)hz / (float)(n + 1);
@@ -223,7 +242,7 @@ int Pacer::applyHysteresis(int want, int mult) {
     return (stableGen_ <= mult - 1) ? stableGen_ : want;
 }
 
-void Pacer::updateSpacingGovernor() {
+void Pacer::updateSpacingGovernor(int hz) {
     // A spacing sleep takes wall-clock time from the game thread. That is free
     // when the game is capped below the panel — the usual frame-generation
     // case, where its own limiter simply sleeps less — and expensive when the
@@ -234,14 +253,34 @@ void Pacer::updateSpacingGovernor() {
     if (emaFrameMs_ <= 0.0f) return;
 
     const float realFps = 1000.0f / emaFrameMs_;
-    // Decay the reference so a genuine scene-complexity drop re-baselines
-    // instead of pinning the scale at zero forever.
-    bestRealFps_ = (realFps > bestRealFps_) ? realFps : bestRealFps_ * 0.999f;
 
-    if (bestRealFps_ > 1.0f && realFps < bestRealFps_ * 0.94f) {
-        spacingScale_ -= 0.08f;   // back off fast: we are costing frames
+    if (lastPaceable_ && stableGen_ >= 0 && hz > 0) {
+        // While the limiter is engaged the real rate is DELIBERATELY held at
+        // Hz/(n+1). Regulating that against a free-run high-water mark makes
+        // the governor read our own limiter as damage and drive the scale to
+        // zero — which removes the spacing sleeps, which puts every synthetic
+        // frame in the vsync slot immediately after its real frame. That is
+        // precisely the strobe this governor exists to prevent, manufactured by
+        // the governor itself. Measured on onyx: a ~100fps loading screen sets
+        // the mark, the limiter then locks 60, and spacing stays off for the
+        // ~500 frames the 0.999/frame decay needs to catch up — long enough to
+        // cover most of a combat encounter. Against the paced target instead,
+        // holding the target IS success.
+        const float target = (float)hz / (float)(stableGen_ + 1);
+        if (realFps >= target * 0.94f) spacingScale_ += 0.02f;
+        else                           spacingScale_ -= 0.08f;
     } else {
-        spacingScale_ += 0.02f;   // creep up: 50 frames to full
+        // Unpaced best-effort: there is no target to hold to, so protect the
+        // real rate against its own recent best. Decay the reference so a
+        // genuine scene-complexity drop re-baselines instead of pinning the
+        // scale at zero forever.
+        bestRealFps_ = (realFps > bestRealFps_) ? realFps
+                                                : bestRealFps_ * 0.999f;
+        if (bestRealFps_ > 1.0f && realFps < bestRealFps_ * 0.94f) {
+            spacingScale_ -= 0.08f;   // back off fast: we are costing frames
+        } else {
+            spacingScale_ += 0.02f;   // creep up: 50 frames to full
+        }
     }
 
     if (spacingScale_ < 0.0f) spacingScale_ = 0.0f;
@@ -255,31 +294,34 @@ Pacer::Tier Pacer::beginPresent(int64_t now, int mult, int hz) {
     }
     lastPresentNs_ = now;
 
-    updateSpacingGovernor();
+    updateSpacingGovernor(hz);
 
-    if (lastReturnNs_ > 0) {
-        const float workMs = (float)(now - lastReturnNs_) / 1e6f;
-        if (plausibleIntervalMs(workMs)) feedEma(emaWorkMs_, workMs);
-    }
+    // The game's own work for this frame. AFME's share is folded in at
+    // endPresent, once it is known — see emaWorkMs_.
+    gameWorkMs_ = (lastReturnNs_ > 0) ? (float)(now - lastReturnNs_) / 1e6f
+                                      : 0.0f;
+    if (!plausibleIntervalMs(gameWorkMs_)) gameWorkMs_ = 0.0f;
 
     Tier t = selectTier(mult, hz);
     if (t.numGen > 0) t.numGen = applyHysteresis(t.numGen, mult);
+    lastPaceable_ = t.paceable;
     return t;
 }
 
 void Pacer::abortPresent(int64_t now) {
     nextDeadlineNs_ = 0;
     lastReturnNs_   = now;  // a passthrough adds no work of its own
+    gameWorkMs_     = 0.0f;
 }
 
-void Pacer::spaceSynth(int index, int numGen) const {
+void Pacer::holdSlot(int slotIndex, int numGen) {
     if (!config().spacing.load(std::memory_order_relaxed)) return;
     if (spacingScale_ <= 0.01f || emaFrameMs_ <= 0.0f) return;
-    if (realPresentNs_ <= 0) return;
+    if (realPresentNs_ <= 0 || slotIndex <= 0) return;
 
     const int64_t intervalNs = (int64_t)(emaFrameMs_ * 1e6f);
     const int64_t slotNs     = intervalNs / (int64_t)(numGen + 1);
-    const int64_t offsetNs   = (int64_t)((float)(slotNs * (int64_t)(index + 1))
+    const int64_t offsetNs   = (int64_t)((float)(slotNs * (int64_t)slotIndex)
                                          * spacingScale_);
 
     // 50ms ceiling: past that the interval estimate is wrong and sleeping on it
@@ -287,8 +329,30 @@ void Pacer::spaceSynth(int index, int numGen) const {
     sleepNs((realPresentNs_ + offsetNs) - nowNs(), 50000000LL);
 }
 
+void Pacer::spaceSynth(int index, int numGen, bool realFirst) {
+    holdSlot(realFirst ? index + 1 : index, numGen);
+}
+
+void Pacer::spaceRealTail(int numGen) {
+    holdSlot(numGen, numGen);
+}
+
 int64_t Pacer::endPresent(int64_t end, int numGen, bool paceable,
                           int64_t vsyncNs) {
+    // Capability is the GAME's work per frame, excluding both our sleeps and
+    // our generation cost.
+    //
+    // Folding AFME's own cost in here was tried and is wrong: that cost is
+    // measured at the CURRENTLY committed tier and then used to judge every
+    // other tier, where it would be a different number. Measuring the ~3-synth
+    // cost and concluding "only the 3-synth tier is affordable" is circular,
+    // and on device it drove a 56fps-capable game to the n=3 tier, whose base
+    // is 30 — the limiter then held it there. The tier must be chosen from what
+    // the game can do; whether the resulting cadence actually holds is the
+    // limiter's problem, not the capability estimate's.
+    if (gameWorkMs_ > 0.0f) feedEma(emaWorkMs_, gameWorkMs_);
+    gameWorkMs_ = 0.0f;
+
     if (!config().limiter.load(std::memory_order_relaxed) || numGen <= 0 ||
         !paceable) {
         nextDeadlineNs_ = 0;
@@ -305,8 +369,11 @@ int64_t Pacer::endPresent(int64_t end, int numGen, bool paceable,
         // legitimately asks for a longer hold than a spacing slot ever does.
         if (sleepNs(nextDeadlineNs_ - end, 100000000LL)) end = nowNs();
         nextDeadlineNs_ += targetNs;
-        // Fell behind on a heavy frame — resync instead of rushing to catch up,
-        // which would bunch presents together.
+        // Fell behind — resync instead of rushing to catch up, which would
+        // bunch presents together. Deliberately does NOT deepen the tier:
+        // missing the deadline means the game is already slower than this base,
+        // so a deeper tier would only sleep it further below a rate it was
+        // never reaching. Generation must never cost real frames.
         if (nextDeadlineNs_ < end) nextDeadlineNs_ = end + targetNs;
     }
 
@@ -326,6 +393,8 @@ void Pacer::reset() {
     spacingScale_   = 0.0f;
     bestRealFps_    = 0.0f;
     nextDeadlineNs_ = 0;
+    gameWorkMs_     = 0.0f;
+    lastPaceable_   = false;
 }
 
 // ─── Stats ──────────────────────────────────────────────────────────────────

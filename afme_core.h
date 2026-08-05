@@ -86,6 +86,13 @@ public:
     std::atomic<bool> pacing{false};   // desiredPresentTime stamping
     std::atomic<bool> limiter{true};   // Swappy-style base-rate lock
 
+    // Anisotropic-filtering override, in taps: 0 = leave the game alone, else
+    // 2/4/8/16 clamped to what the driver reports. Third independent feature
+    // behind `enabled`, alongside frame generation and the color filter —
+    // there is no driver property for AF on Adreno, so the layers force it at
+    // sampler-creation time.
+    std::atomic<int>  af{0};              // persist.sys.afme.af
+
     // Quality
     std::atomic<bool> vrsFg{true};        // VRS on our own fragment passes
     std::atomic<bool> hudMask{true};      // HUD ghost protection (motion path)
@@ -202,8 +209,20 @@ public:
      * the synthetic one for 25ms (measured present-to-present: 8ms x856,
      * 24ms x594). That is 60 presents a second that still read as 30fps with a
      * strobe. Spacing is what makes generation visible.
+     *
+     * @p realFirst is true for extrapolation, where the real frame already went
+     * out at the anchor and the synths fill the slots AFTER it. It is false for
+     * interpolation, where the synths come first and the real frame occupies
+     * the last slot — there synth 0 must fire at the anchor itself, and the
+     * real frame is held by spaceRealTail(). Spacing interpolation as if the
+     * real frame led would bunch the real frame against the final synth: at 2x
+     * that is half of all presents arriving as a pair, which throws away half
+     * the smoothing the generation just paid for.
      */
-    void spaceSynth(int index, int numGen) const;
+    void spaceSynth(int index, int numGen, bool realFirst);
+
+    /** Interpolation only: hold the real frame until the interval's last slot. */
+    void spaceRealTail(int numGen);
 
     /**
      * Close the present, applying the frame limiter, and return the time the
@@ -224,9 +243,11 @@ public:
     float intervalMs() const { return emaFrameMs_; }
 
 private:
-    void updateSpacingGovernor();
+    void updateSpacingGovernor(int hz);
     Tier selectTier(int mult, int hz) const;
     int  applyHysteresis(int want, int mult);
+    /** Sleep until slot @p slotIndex of (numGen+1) past the anchor. */
+    void holdSlot(int slotIndex, int numGen);
 
     // Timing
     int64_t lastPresentNs_ = 0;
@@ -238,8 +259,23 @@ private:
     // from the raw interval creates a dead zone: measured on ZZZ city at
     // 39-45fps free-run on 120Hz, too fast for the <=40.8fps two-synth clamp and
     // too slow for one synth to fill the panel, giving 86 uneven presents.
+    //
+    // It deliberately excludes AFME's own generation cost. Folding that in was
+    // tried and is circular: the cost is only ever measured at the committed
+    // tier, and applying it to the others made a 56fps-capable game look like a
+    // 30fps one, so the tier search picked n=3 and the limiter then held the
+    // game at that tier's 30fps base. Generation must never buy synthetic
+    // frames with real ones.
     float   emaWorkMs_    = 0.0f;
     int64_t lastReturnNs_ = 0;
+
+    // The game's own work for the present in flight, folded into emaWorkMs_ at
+    // endPresent so a passthrough can discard it.
+    float   gameWorkMs_ = 0.0f;
+
+    // Was the last committed tier paceable? Selects which reference the spacing
+    // governor regulates against — see updateSpacingGovernor().
+    bool lastPaceable_ = false;
 
     // Committed tier + hysteresis counters
     int stableGen_   = -1;

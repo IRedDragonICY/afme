@@ -45,6 +45,7 @@
  *   persist.sys.afme.method     = 0/1       0=extrapolate, 1=motion estimation
  *   persist.sys.afme.factor     = float     phase override (0/empty = auto)
  *   persist.sys.afme.display_hz = int       panel rate, for the headroom clamp
+ *   persist.sys.afme.af         = 0/2/4/8/16  anisotropic filtering override
  */
 
 #include <EGL/egl.h>
@@ -106,6 +107,10 @@ typedef void (*PFNGLTEXIMAGE2DPROC_)(GLenum, GLint, GLint, GLsizei, GLsizei,
                                       GLint, GLenum, GLenum, const void*);
 typedef void (*PFNGLTEXSTORAGE2DPROC_)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
 typedef void (*PFNGLTEXPARAMETERIPROC_)(GLenum, GLenum, GLint);
+typedef void (*PFNGLTEXPARAMETERFPROC_)(GLenum, GLenum, GLfloat);
+typedef void (*PFNGLSAMPLERPARAMETERIPROC_)(GLuint, GLenum, GLint);
+typedef void (*PFNGLSAMPLERPARAMETERFPROC_)(GLuint, GLenum, GLfloat);
+typedef const GLubyte* (*PFNGLGETSTRINGPROC_)(GLenum);
 typedef void (*PFNGLACTIVETEXTUREPROC_)(GLenum);
 typedef void (*PFNGLGENERATEMIPMAPPROC_)(GLenum);
 typedef void (*PFNGLFINISHPROC)(void);
@@ -178,6 +183,10 @@ struct GLFuncs {
     PFNGLTEXIMAGE2DPROC_         TexImage2D = nullptr;
     PFNGLTEXSTORAGE2DPROC_       TexStorage2D = nullptr;
     PFNGLTEXPARAMETERIPROC_      TexParameteri = nullptr;
+    PFNGLTEXPARAMETERFPROC_      TexParameterf = nullptr;
+    PFNGLSAMPLERPARAMETERIPROC_  SamplerParameteri = nullptr;
+    PFNGLSAMPLERPARAMETERFPROC_  SamplerParameterf = nullptr;
+    PFNGLGETSTRINGPROC_          GetString = nullptr;
     PFNGLACTIVETEXTUREPROC_      ActiveTexture = nullptr;
     PFNGLGENERATEMIPMAPPROC_     GenerateMipmap = nullptr;
     PFNGLFINISHPROC              Finish = nullptr;
@@ -383,6 +392,10 @@ void resolveGLFunctions() {
     RESOLVE(TexImage2D, PFNGLTEXIMAGE2DPROC_, "glTexImage2D");
     RESOLVE(TexStorage2D, PFNGLTEXSTORAGE2DPROC_, "glTexStorage2D");
     RESOLVE(TexParameteri, PFNGLTEXPARAMETERIPROC_, "glTexParameteri");
+    RESOLVE(TexParameterf, PFNGLTEXPARAMETERFPROC_, "glTexParameterf");
+    RESOLVE(SamplerParameteri, PFNGLSAMPLERPARAMETERIPROC_, "glSamplerParameteri");
+    RESOLVE(SamplerParameterf, PFNGLSAMPLERPARAMETERFPROC_, "glSamplerParameterf");
+    RESOLVE(GetString, PFNGLGETSTRINGPROC_, "glGetString");
     RESOLVE(ActiveTexture, PFNGLACTIVETEXTUREPROC_, "glActiveTexture");
     RESOLVE(GenerateMipmap, PFNGLGENERATEMIPMAPPROC_, "glGenerateMipmap");
     RESOLVE(Finish, PFNGLFINISHPROC, "glFinish");
@@ -1147,7 +1160,10 @@ EGLBoolean EGLAPIENTRY afme_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
             // serialized by the GPU. The blit reads completed generation work.
             // eglSwapBuffers does an implicit flush before presenting.
             blitTextureToFramebuffer(*state, presentSrc);
-            state->pacer.spaceSynth(i, numGenFrames);
+            // This layer always presents the real frame first (step 3 above),
+            // including on the motion path, so the synths always fill the slots
+            // after it.
+            state->pacer.spaceSynth(i, numGenFrames, /*realFirst=*/true);
             if (afme::config().pacing.load(std::memory_order_relaxed) &&
                     sGL.PresentationTime && state->pacer.intervalMs() > 0.0f) {
                 // Ask SurfaceFlinger to latch THIS buffer at its temporal
@@ -1241,6 +1257,157 @@ EGLBoolean EGLAPIENTRY afme_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
     return next(dpy, interval);
 }
 
+// ─── Anisotropic filtering override ─────────────────────────────────────────
+//
+// There is no driver property for AF on Adreno. Both user-mode drivers were
+// dumped off the device and searched: libGLESv2_adreno.so mentions anisotropy
+// exactly once, as the extension name string, and reads no property that could
+// carry a level; vulkan.adreno.so has no anisotropy string at all. So the only
+// place the override CAN happen is where the state is set — here, in the layer
+// that already sits in front of the game's GL calls.
+//
+// Every mipmapped texture the game creates gets its anisotropy raised, and a
+// *_MIPMAP_NEAREST min filter is promoted to *_MIPMAP_LINEAR so the mip
+// transition is smooth enough for the extra taps to be worth anything. The
+// magnification half of the filter is left exactly as the game set it, so
+// point-sampled art stays point-sampled.
+//
+// Only mipmapped filters are touched. That is deliberate: it excludes render
+// targets, UI atlases, lookup tables and GL_TEXTURE_EXTERNAL_OES — none of which
+// have mips, and none of which anisotropy could improve.
+
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
+
+std::once_flag sGlResolveOnce;
+std::atomic<int> sAfDriverMax{-1};   // -1 = not probed, 0 = unsupported
+
+/**
+ * Highest tap count the driver accepts, or 0 when AF is unavailable.
+ *
+ * The extension string is checked BEFORE the limit query: asking glGetIntegerv
+ * for an unsupported enum would push GL_INVALID_ENUM into the app's error queue,
+ * and a game that checks glGetError would see a failure it did not cause.
+ */
+int afDriverMax() {
+    const int cached = sAfDriverMax.load(std::memory_order_relaxed);
+    if (cached >= 0) return cached;
+
+    int taps = 0;
+    if (sGL.GetString && sGL.GetIntegerv) {
+        const char* ext = reinterpret_cast<const char*>(sGL.GetString(GL_EXTENSIONS));
+        if (ext && strstr(ext, "GL_EXT_texture_filter_anisotropic")) {
+            GLint maxTaps = 0;
+            sGL.GetIntegerv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxTaps);
+            if (maxTaps > 1) taps = (int)maxTaps;
+        }
+    }
+    sAfDriverMax.store(taps, std::memory_order_relaxed);
+    ALOGI("AFME: anisotropic filtering %s (driver max %dx)",
+          taps ? "available" : "NOT available", taps);
+    return taps;
+}
+
+/** Taps to force, or 0 to leave this call alone. */
+int afTapsFor(GLenum pname, GLint filter) {
+    if (pname != GL_TEXTURE_MIN_FILTER) return 0;
+    const int want = afme::config().af.load(std::memory_order_relaxed);
+    if (want <= 0) return 0;
+    switch (filter) {
+        case GL_NEAREST_MIPMAP_NEAREST:
+        case GL_NEAREST_MIPMAP_LINEAR:
+        case GL_LINEAR_MIPMAP_NEAREST:
+        case GL_LINEAR_MIPMAP_LINEAR:
+            break;
+        default:
+            return 0;   // no mips: nothing for anisotropy to sample
+    }
+    // Resolving here rather than at first present: games build most of their
+    // textures before the first frame, so the hook fires first.
+    std::call_once(sGlResolveOnce, [] { resolveGLFunctions(); });
+    const int driverMax = afDriverMax();
+    if (driverMax <= 1) return 0;
+    return want < driverMax ? want : driverMax;
+}
+
+/** Trilinear equivalent of a mip filter, preserving the in-mip component. */
+GLint afSmoothMipFilter(GLint filter) {
+    switch (filter) {
+        case GL_NEAREST_MIPMAP_NEAREST: return GL_NEAREST_MIPMAP_LINEAR;
+        case GL_LINEAR_MIPMAP_NEAREST:  return GL_LINEAR_MIPMAP_LINEAR;
+        default:                        return filter;
+    }
+}
+
+// Next-in-chain pointers for the AF hooks, cached at layer setup. The generic
+// sFuncMap path takes a mutex and hashes a string; these four sit on the app's
+// texture-setup path, which a level load walks thousands of times.
+enum AfProc { kTexParamI, kTexParamF, kSamplerParamI, kSamplerParamF, kAfProcCount };
+std::atomic<void*> sAfNext[kAfProcCount]{};
+
+/** Record a next-in-chain pointer if `name` is one of the AF hooks. */
+void cacheAfNext(const char* name, EGLFuncPointer next) {
+    static const char* const kNames[kAfProcCount] = {
+        "glTexParameteri", "glTexParameterf",
+        "glSamplerParameteri", "glSamplerParameterf",
+    };
+    for (int i = 0; i < kAfProcCount; ++i) {
+        if (!strcmp(name, kNames[i])) {
+            sAfNext[i].store(reinterpret_cast<void*>(next), std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+template <typename T>
+T afNext(AfProc which) {
+    return reinterpret_cast<T>(sAfNext[which].load(std::memory_order_relaxed));
+}
+
+void GL_APIENTRY afme_glTexParameteri(GLenum target, GLenum pname, GLint param) {
+    auto real = afNext<PFNGLTEXPARAMETERIPROC_>(kTexParamI);
+    if (!real) return;
+    const int taps = afTapsFor(pname, param);
+    real(target, pname, taps ? afSmoothMipFilter(param) : param);
+    if (taps && sGL.TexParameterf) {
+        sGL.TexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, (GLfloat)taps);
+    }
+}
+
+void GL_APIENTRY afme_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+    auto real = afNext<PFNGLTEXPARAMETERFPROC_>(kTexParamF);
+    if (!real) return;
+    const int taps = afTapsFor(pname, (GLint)param);
+    real(target, pname, taps ? (GLfloat)afSmoothMipFilter((GLint)param) : param);
+    if (taps && sGL.TexParameterf) {
+        sGL.TexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, (GLfloat)taps);
+    }
+}
+
+void GL_APIENTRY afme_glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
+    auto real = afNext<PFNGLSAMPLERPARAMETERIPROC_>(kSamplerParamI);
+    if (!real) return;
+    const int taps = afTapsFor(pname, param);
+    real(sampler, pname, taps ? afSmoothMipFilter(param) : param);
+    if (taps && sGL.SamplerParameterf) {
+        sGL.SamplerParameterf(sampler, GL_TEXTURE_MAX_ANISOTROPY_EXT, (GLfloat)taps);
+    }
+}
+
+void GL_APIENTRY afme_glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
+    auto real = afNext<PFNGLSAMPLERPARAMETERFPROC_>(kSamplerParamF);
+    if (!real) return;
+    const int taps = afTapsFor(pname, (GLint)param);
+    real(sampler, pname, taps ? (GLfloat)afSmoothMipFilter((GLint)param) : param);
+    if (taps && sGL.SamplerParameterf) {
+        sGL.SamplerParameterf(sampler, GL_TEXTURE_MAX_ANISOTROPY_EXT, (GLfloat)taps);
+    }
+}
+
 // ─── EGL Layer Interface ────────────────────────────────────────────────────
 
 EGLFuncPointer eglGPA(const char* funcName) {
@@ -1250,6 +1417,14 @@ EGLFuncPointer eglGPA(const char* funcName) {
     GETPROCADDR(eglSwapBuffers);
     GETPROCADDR(eglDestroySurface);
     GETPROCADDR(eglSwapInterval);
+
+    // Anisotropic filtering override. Claimed unconditionally rather than only
+    // when AF is on, because the layer's entry points are wired once at load
+    // time and the setting is changed live, per game, long after that.
+    GETPROCADDR(glTexParameteri);
+    GETPROCADDR(glTexParameterf);
+    GETPROCADDR(glSamplerParameteri);
+    GETPROCADDR(glSamplerParameterf);
 
     #undef GETPROCADDR
     return nullptr;
@@ -1261,17 +1436,21 @@ void glesLayer_InitializeLayer(
     sLayerId = layer_id;
     sGetNextLayerProcAddress = get_next_layer_proc_address;
     afme::config().poll();
-    ALOGI("AFME: Layer initialized (enabled=%d multiplier=%d method=%d)",
-          afme::config().enabled.load(), afme::config().multiplier.load(),
-          afme::config().method.load());
+    ALOGI("AFME: Layer initialized (enabled=%d fg=%d multiplier=%d method=%d af=%dx)",
+          afme::config().enabled.load(), afme::config().fg.load(),
+          afme::config().multiplier.load(), afme::config().method.load(),
+          afme::config().af.load());
 }
 
 EGLFuncPointer glesLayer_GetLayerProcAddress(
         const char* funcName, EGLFuncPointer next) {
     EGLFuncPointer entry = eglGPA(funcName);
     if (entry != nullptr) {
-        std::lock_guard<std::mutex> lock(sMapMutex);
-        sFuncMap[std::string(funcName)] = next;
+        {
+            std::lock_guard<std::mutex> lock(sMapMutex);
+            sFuncMap[std::string(funcName)] = next;
+        }
+        cacheAfNext(funcName, next);
         return entry;
     }
     return next;

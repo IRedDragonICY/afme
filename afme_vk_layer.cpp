@@ -143,6 +143,9 @@ PFN_vkDestroySemaphore     next_vkDestroySemaphore{};
 
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID next_vkGetAndroidHardwareBufferProperties{};
 PFN_vkGetPhysicalDeviceMemoryProperties next_vkGetPhysicalDeviceMemoryProperties{};
+PFN_vkGetPhysicalDeviceProperties next_vkGetPhysicalDeviceProperties{};
+PFN_vkGetPhysicalDeviceFeatures next_vkGetPhysicalDeviceFeatures{};
+PFN_vkCreateSampler        next_vkCreateSampler{};
 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR next_vkGetPhysicalDeviceSurfaceCapabilities{};
 PFN_vkEnumerateDeviceExtensionProperties next_vkEnumerateDeviceExtensionProperties{};
 PFN_vkGetFenceFdKHR           next_vkGetFenceFdKHR{};
@@ -515,8 +518,8 @@ struct AFMEContext {
     // are locked to the current real frame instead of the warped/interpolated
     // value — which is what stops the classic FG "shadow trail" on UI.
     GLuint hudMaskProg = 0;        // block-grid static accumulation
-    GLuint hudMaskTex = 0;         // R8, W/blockX × H/blockY (write side)
-    GLuint prevHudMaskTex = 0;     // R8, read side (baseline, swapped)
+    GLuint hudMaskTex = 0;         // R32F, W/blockX × H/blockY (write side)
+    GLuint prevHudMaskTex = 0;     // R32F, read side (baseline, swapped)
 
     bool initialized = false;
     bool afmeHWAvailable = false;
@@ -967,7 +970,12 @@ layout(binding=0) uniform mediump sampler2D r_curr_luma;
 layout(binding=1) uniform mediump sampler2D r_prev_luma;
 layout(binding=2) uniform highp sampler2D r_block_mv;
 layout(binding=3) uniform mediump sampler2D r_prev_mask;
-layout(r8, binding=0) writeonly uniform mediump image2D rw_mask;
+// r32f, NOT r8: ESSL 3.10 only guarantees rgba32f/rgba16f/r32f/rgba8/
+// rgba8_snorm/rgba*ui/r32ui/rgba*i/r32i as image formats. The Adreno compiler
+// rejects r8 ("not a legal layout qualifier id"), which failed the whole of
+// initMobFGSR and silently downgraded method=motion to extrapolation — the
+// interpolation engine never ran once on device.
+layout(r32f, binding=0) writeonly uniform highp image2D rw_mask;
 uniform ivec2 lumaSize;
 uniform ivec2 blockSize;
 uniform float lumaThr;
@@ -1235,20 +1243,23 @@ static bool initMobFGSR(AFMEContext& ctx) {
 
     // HUD mask ping-pong at the ME block grid; LINEAR so the warp pass gets
     // soft mask edges for free (hard 8px block edges would halo visibly).
-    ctx.hudMaskTex = createGLTex(GL_R8, mvW, mvH, GL_LINEAR);
-    ctx.prevHudMaskTex = createGLTex(GL_R8, mvW, mvH, GL_LINEAR);
+    ctx.hudMaskTex = createGLTex(GL_R32F, mvW, mvH, GL_LINEAR);
+    ctx.prevHudMaskTex = createGLTex(GL_R32F, mvW, mvH, GL_LINEAR);
 
     // Initialize both mask sides to 0 (no HUD assumed) — garbage would
-    // otherwise pollute the first seconds of accumulation.
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx.lumaFbo);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, ctx.hudMaskTex, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, ctx.prevHudMaskTex, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    // otherwise pollute the first seconds of accumulation. Uploaded rather than
+    // cleared through an FBO: R32F is only color-renderable with
+    // EXT_color_buffer_float, and an incomplete-FBO clear would leave the masks
+    // undefined on any driver that lacks it.
+    {
+        std::vector<float> zeros((size_t)mvW * (size_t)mvH, 0.0f);
+        for (GLuint t : {ctx.hudMaskTex, ctx.prevHudMaskTex}) {
+            glBindTexture(GL_TEXTURE_2D, t);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)mvW, (GLsizei)mvH,
+                            GL_RED, GL_FLOAT, zeros.data());
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
 
     ctx.mobfgsrInitialized = true;
     ALOGI("AFME: MobFGSR initialized (%ux%u, MV block %dx%d → %ux%u, hud mask %ux%u)",
@@ -1346,7 +1357,7 @@ static void applyMobFGSRPrepare(AFMEContext& ctx) {
         glBindTexture(GL_TEXTURE_2D, ctx.motionVecBlockTex);
         glActiveTexture(GL_TEXTURE3);
         glBindTexture(GL_TEXTURE_2D, ctx.prevHudMaskTex);
-        glBindImageTexture(0, ctx.hudMaskTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8);
+        glBindImageTexture(0, ctx.hudMaskTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
         glUniform2i(glGetUniformLocation(ctx.hudMaskProg, "lumaSize"), (GLint)w, (GLint)h);
         glUniform2i(glGetUniformLocation(ctx.hudMaskProg, "blockSize"),
                     ctx.motionBlockX, ctx.motionBlockY);
@@ -1842,20 +1853,77 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateInstance(
     initInstanceFunc(*pInstance, "vkCreateDevice", &next_vkCreateDevice);
     initInstanceFunc(*pInstance, "vkGetPhysicalDeviceMemoryProperties",
                      &next_vkGetPhysicalDeviceMemoryProperties);
+    initInstanceFunc(*pInstance, "vkGetPhysicalDeviceProperties",
+                     &next_vkGetPhysicalDeviceProperties);
+    initInstanceFunc(*pInstance, "vkGetPhysicalDeviceFeatures",
+                     &next_vkGetPhysicalDeviceFeatures);
     initInstanceFunc(*pInstance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
                      &next_vkGetPhysicalDeviceSurfaceCapabilities);
     initInstanceFunc(*pInstance, "vkEnumerateDeviceExtensionProperties",
                      &next_vkEnumerateDeviceExtensionProperties);
 
     afme::config().poll();
-    ALOGI("AFME VK Layer v8: Instance created (enabled=%d multiplier=%dx)",
-          afme::config().enabled.load(), afme::config().multiplier.load());
+    ALOGI("AFME VK Layer v8: Instance created (enabled=%d fg=%d multiplier=%dx af=%dx)",
+          afme::config().enabled.load(), afme::config().fg.load(),
+          afme::config().multiplier.load(), afme::config().af.load());
     return VK_SUCCESS;
 }
 
 static VKAPI_ATTR void VKAPI_CALL layer_vkDestroyInstance(
         VkInstance instance, const VkAllocationCallbacks* pAllocator) {
     if (next_vkDestroyInstance) next_vkDestroyInstance(instance, pAllocator);
+}
+
+// ─── Anisotropic filtering override ─────────────────────────────────────────
+//
+// There is no driver property for AF on Adreno — see the matching section in
+// afme_layer.cpp for the evidence. The override therefore happens where the
+// state is actually created: every sampler the game builds for a mipmapped
+// texture gets its anisotropy raised on the way through.
+//
+// Set at device creation, read at sampler creation.
+std::atomic<bool>  gAfAnisoEnabled{false};  // samplerAnisotropy on this device
+std::atomic<float> gAfDriverMax{1.0f};      // limits.maxSamplerAnisotropy
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateSampler(
+        VkDevice device,
+        const VkSamplerCreateInfo* pCreateInfo,
+        const VkAllocationCallbacks* pAllocator,
+        VkSampler* pSampler) {
+    if (!next_vkCreateSampler) return VK_ERROR_INITIALIZATION_FAILED;
+
+    const int want = afme::config().af.load(std::memory_order_relaxed);
+    const float driverMax = gAfDriverMax.load(std::memory_order_relaxed);
+
+    // Every condition here is a spec requirement or a case anisotropy cannot
+    // help, not a heuristic:
+    //   - the feature must be enabled on the device (VUID-anisotropyEnable)
+    //   - unnormalizedCoordinates forbids anisotropy outright
+    //   - cubic filtering forbids it too
+    //   - maxLod == minLod means the sampler never leaves one mip level, so
+    //     there is no minification footprint to sample along
+    const bool eligible =
+        want > 1 &&
+        gAfAnisoEnabled.load(std::memory_order_relaxed) &&
+        driverMax > 1.0f &&
+        pCreateInfo != nullptr &&
+        pCreateInfo->anisotropyEnable == VK_FALSE &&
+        pCreateInfo->unnormalizedCoordinates == VK_FALSE &&
+        pCreateInfo->magFilter != VK_FILTER_CUBIC_EXT &&
+        pCreateInfo->minFilter != VK_FILTER_CUBIC_EXT &&
+        pCreateInfo->maxLod > pCreateInfo->minLod;
+
+    if (!eligible) {
+        return next_vkCreateSampler(device, pCreateInfo, pAllocator, pSampler);
+    }
+
+    VkSamplerCreateInfo info = *pCreateInfo;
+    info.anisotropyEnable = VK_TRUE;
+    info.maxAnisotropy = (float)want < driverMax ? (float)want : driverMax;
+    // Same reasoning as the GLES path: extra taps are wasted if the mip
+    // transition itself is a hard cut.
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    return next_vkCreateSampler(device, &info, pAllocator, pSampler);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateDevice(
@@ -1943,20 +2011,75 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkCreateDevice(
     modifiedCreateInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     modifiedCreateInfo.ppEnabledExtensionNames = extensions.data();
 
+    // ── Anisotropic filtering: enable the feature the override needs ────────
+    //
+    // vkCreateSampler may only set anisotropyEnable if samplerAnisotropy was
+    // enabled at device creation, and a game that never uses AF has no reason to
+    // ask for it. So turn it on here, once, and remember whether it took — the
+    // sampler hook must not touch anisotropy on a device that lacks it.
+    //
+    // pEnabledFeatures and a VkPhysicalDeviceFeatures2 in pNext are mutually
+    // exclusive, so exactly one of the two branches applies.
+    VkPhysicalDeviceFeatures afFeatures{};
+    VkPhysicalDeviceFeatures2* appFeatures2 = nullptr;
+    VkBool32 savedFeatures2Aniso = VK_FALSE;
+    bool wantAniso = false;
+    if (next_vkGetPhysicalDeviceFeatures) {
+        VkPhysicalDeviceFeatures supported{};
+        next_vkGetPhysicalDeviceFeatures(physicalDevice, &supported);
+        wantAniso = supported.samplerAnisotropy == VK_TRUE;
+    }
+    if (wantAniso) {
+        for (auto* p = reinterpret_cast<const VkBaseInStructure*>(pCreateInfo->pNext);
+             p != nullptr; p = p->pNext) {
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+                appFeatures2 = const_cast<VkPhysicalDeviceFeatures2*>(
+                    reinterpret_cast<const VkPhysicalDeviceFeatures2*>(p));
+                break;
+            }
+        }
+        if (appFeatures2) {
+            // Flip it in place for the duration of the call and restore after:
+            // the chain is the app's memory and it may create a second device
+            // from the same structs.
+            savedFeatures2Aniso = appFeatures2->features.samplerAnisotropy;
+            appFeatures2->features.samplerAnisotropy = VK_TRUE;
+        } else {
+            if (pCreateInfo->pEnabledFeatures) afFeatures = *pCreateInfo->pEnabledFeatures;
+            afFeatures.samplerAnisotropy = VK_TRUE;
+            modifiedCreateInfo.pEnabledFeatures = &afFeatures;
+        }
+    }
+
     auto createDevice = reinterpret_cast<PFN_vkCreateDevice>(
         gipaNext(VK_NULL_HANDLE, "vkCreateDevice"));
     VkResult result = createDevice(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
     if (result != VK_SUCCESS) {
         // Fallback: try without our extensions
         ALOGW("AFME: Device creation with AHB extensions failed, trying original");
+        if (appFeatures2) appFeatures2->features.samplerAnisotropy = savedFeatures2Aniso;
         result = createDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
         if (result != VK_SUCCESS) return result;
         hasGoogleTiming = false;  // our extension list was not applied
         hasNativeFence = false;
+        // The retry used the app's own create info, so the feature is only on if
+        // the app asked for it itself.
+        wantAniso = (appFeatures2 && savedFeatures2Aniso == VK_TRUE)
+                 || (!appFeatures2 && pCreateInfo->pEnabledFeatures
+                     && pCreateInfo->pEnabledFeatures->samplerAnisotropy == VK_TRUE);
+    } else if (appFeatures2) {
+        appFeatures2->features.samplerAnisotropy = savedFeatures2Aniso;
+    }
+    gAfAnisoEnabled.store(wantAniso, std::memory_order_relaxed);
+    if (wantAniso && next_vkGetPhysicalDeviceProperties) {
+        VkPhysicalDeviceProperties props{};
+        next_vkGetPhysicalDeviceProperties(physicalDevice, &props);
+        gAfDriverMax.store(props.limits.maxSamplerAnisotropy, std::memory_order_relaxed);
     }
 
     // Resolve device functions
     initDeviceFunc(*pDevice, "vkDestroyDevice", &next_vkDestroyDevice);
+    initDeviceFunc(*pDevice, "vkCreateSampler", &next_vkCreateSampler);
     initDeviceFunc(*pDevice, "vkQueuePresentKHR", &next_vkQueuePresentKHR);
     initDeviceFunc(*pDevice, "vkQueueSubmit", &next_vkQueueSubmit);
     initDeviceFunc(*pDevice, "vkGetDeviceQueue", &next_vkGetDeviceQueue);
@@ -2644,16 +2767,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             initMobFGSR(ctx);
         }
 
-        // Determine frame generation source textures
-        // If SGSR1 is enabled, apply sharpening to currFrame first
+        // Generation reads the RAW frame pair.
+        //
+        // This used to sharpen currFrame and hand the sharpened copy to
+        // generation as src2 while src1 stayed raw. Sharpening exactly one of
+        // the two inputs injects a full-frame high-frequency delta, and QCOM's
+        // block matcher scores that delta as MOTION: every synthetic frame was
+        // displaced along a bogus global vector, and alternating with untouched
+        // real frames the whole image snapped top-left <-> bottom-right once per
+        // real frame. Confirmed on onyx/Genshin — persist.sys.sgsr.mode=0 made
+        // the artifact vanish completely, and moving the pass here kept the
+        // sharpening while removing the artifact.
+        //
+        // SGSR1 is a presentation sharpener, so it belongs on the generated
+        // RESULT: same visual gain, motion estimation left honest.
         GLuint srcPrevTex = ctx.prevFrame.glTex;
         GLuint srcCurrTex = ctx.currFrame.glTex;
-
-        if (sgsrMode >= 1 && ctx.sgsrInitialized && ctx.sharpenedFrame.glTex) {
-            applySGSR1(ctx, ctx.currFrame.glTex, ctx.sharpenedFrame.glTex,
-                       ctx.extent.width, ctx.extent.height);
-            srcCurrTex = ctx.sharpenedFrame.glTex;
-        }
+        bool sharpen = sgsrMode >= 1 && ctx.sgsrInitialized &&
+                       ctx.sharpenedFrame.glTex;
 
         // Motion estimation / dilation run ONCE per real frame; only the
         // warp is repeated per generated frame (3x/4x no longer pay ME 2-3×)
@@ -2661,10 +2792,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             applyMobFGSRPrepare(ctx);
         }
 
-        if (stageB && !ctx.genScratchTex) {
+        // Interpolation already lands in fgResultTex, so only the extrapolation
+        // path needs somewhere to write before a post pass reads it back.
+        if (!interpolation && (stageB || sharpen) && !ctx.genScratchTex) {
             ctx.genScratchTex = createGLTex(GL_RGBA8, ctx.extent.width,
                                             ctx.extent.height, GL_LINEAR);
-            if (!ctx.genScratchTex) stageB = false;
+            if (!ctx.genScratchTex) { stageB = false; sharpen = false; }
         }
 
         float userFactor = afme::config().factorOverride.load();  // 0 = auto
@@ -2678,40 +2811,46 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             float autoFactor = (float)(i + 1) / (float)(numGenFrames + 1);
             float factor = (userFactor > 0.0f) ? autoFactor * userFactor : autoFactor;
 
+            // ── produce the raw generated frame ──────────────────────────
+            GLuint rawTex;
             if (interpolation) {
                 // ═══ MobFGSR interpolation ═══
                 applyMobFGSRWarp(ctx, factor);
-
-                if (stageB) {
-                    // Stage B REPLACES the result→AHB copy here rather than
-                    // adding a pass: it has to read fgResultTex and write the
-                    // AHB either way.
-                    ctx.filter.applyStageB(ctx.fgResultTex,
-                                           ctx.synthFrames[i].glTex,
-                                           ctx.extent.width, ctx.extent.height,
-                                           fp, ctx.frameIdx * 8 + (uint64_t)i);
-                } else {
-                    glCopyImageSubData(
-                        ctx.fgResultTex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                        ctx.synthFrames[i].glTex, GL_TEXTURE_2D, 0, 0, 0, 0,
-                        ctx.extent.width, ctx.extent.height, 1);
-                }
+                rawTex = ctx.fgResultTex;
             } else {
                 // ═══ HW Extrapolation (modes 0-2) ═══
-                // A pass cannot read and write one texture, so with stage B on
-                // the driver writes scratch and stage B copies out.
-                ctx.glExtrapolateTex2D(
-                    srcPrevTex,
-                    srcCurrTex,
-                    stageB ? ctx.genScratchTex : ctx.synthFrames[i].glTex,
-                    factor
-                );
-                if (stageB) {
-                    ctx.filter.applyStageB(ctx.genScratchTex,
-                                           ctx.synthFrames[i].glTex,
-                                           ctx.extent.width, ctx.extent.height,
-                                           fp, ctx.frameIdx * 8 + (uint64_t)i);
-                }
+                // A pass cannot read and write one texture, so whenever a post
+                // pass follows, the driver writes scratch and the post pass
+                // reads it back out into the synth AHB.
+                rawTex = (sharpen || stageB) ? ctx.genScratchTex
+                                             : ctx.synthFrames[i].glTex;
+                ctx.glExtrapolateTex2D(srcPrevTex, srcCurrTex, rawTex, factor);
+            }
+
+            // ── post chain: sharpen → screen-space effects → synth AHB ────
+            // Each step writes the next stage's input; the last one must land
+            // in synthFrames[i], which is what gets blitted to the swapchain.
+            if (sharpen && stageB) {
+                applySGSR1(ctx, rawTex, ctx.sharpenedFrame.glTex,
+                           ctx.extent.width, ctx.extent.height);
+                ctx.filter.applyStageB(ctx.sharpenedFrame.glTex,
+                                       ctx.synthFrames[i].glTex,
+                                       ctx.extent.width, ctx.extent.height,
+                                       fp, ctx.frameIdx * 8 + (uint64_t)i);
+            } else if (sharpen) {
+                applySGSR1(ctx, rawTex, ctx.synthFrames[i].glTex,
+                           ctx.extent.width, ctx.extent.height);
+            } else if (stageB) {
+                // Stage B REPLACES the result→AHB copy rather than adding a
+                // pass: it has to read rawTex and write the AHB either way.
+                ctx.filter.applyStageB(rawTex, ctx.synthFrames[i].glTex,
+                                       ctx.extent.width, ctx.extent.height,
+                                       fp, ctx.frameIdx * 8 + (uint64_t)i);
+            } else if (interpolation) {
+                glCopyImageSubData(
+                    rawTex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                    ctx.synthFrames[i].glTex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                    ctx.extent.width, ctx.extent.height, 1);
             }
 
             if ((fc % 300) == 0 && i == 0) {
@@ -2780,8 +2919,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             }
 
             uint32_t newIdx = 0;
+            // 2ms, not 100ms: this runs on the game's render thread, and a
+            // starved swapchain used to stall it for a twelfth of a second.
+            // A synthetic frame is always worth dropping instead.
             VkResult acqResult = next_vkAcquireNextImageKHR(
-                ctx.device, swapchain, 100000000ULL,
+                ctx.device, swapchain, 2000000ULL,
                 acquireSem, VK_NULL_HANDLE, &newIdx);
 
             if (acqResult != VK_SUCCESS && acqResult != VK_SUBOPTIMAL_KHR) {
@@ -2872,7 +3014,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
             //
             // Scaled by the governor, so if the sleep turns out to cost the
             // game real frames this decays to a no-op on its own.
-            ctx.pacer.spaceSynth(i, numGenFrames);
+            ctx.pacer.spaceSynth(i, numGenFrames, !interpolation);
 
             next_vkQueuePresentKHR(queue, &genPresent);
             ctx.stats.addGen();
@@ -2889,6 +3031,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         // the native-fence path the fence was never CPU-waited during the
         // frame; by now it is already signaled, so this is ~free.)
         next_vkWaitForFences(ctx.device, 1, &ctx.copyFence, VK_TRUE, 16000000ULL);
+        // The real frame owns the LAST slot of the interval. Without this hold
+        // it goes out immediately behind the final synth, so at 2x half of all
+        // presents arrive as a bunched pair.
+        ctx.pacer.spaceRealTail(numGenFrames);
         VkPresentInfoKHR realPresent = {};
         realPresent.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         realPresent.pNext = pPresentInfo->pNext;
@@ -2958,6 +3104,9 @@ static const std::unordered_map<std::string, PFN_vkVoidFunction> kDeviceHooks = 
     {"vkCreateSwapchainKHR",    reinterpret_cast<PFN_vkVoidFunction>(&layer_vkCreateSwapchainKHR)},
     {"vkDestroySwapchainKHR",   reinterpret_cast<PFN_vkVoidFunction>(&layer_vkDestroySwapchainKHR)},
     {"vkDestroyDevice",         reinterpret_cast<PFN_vkVoidFunction>(&layer_vkDestroyDevice)},
+    // Claimed unconditionally: the dispatch table is built once at device
+    // creation, and AF is switched live, per game, long after that.
+    {"vkCreateSampler",         reinterpret_cast<PFN_vkVoidFunction>(&layer_vkCreateSampler)},
 };
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_vkGetInstanceProcAddr(
