@@ -242,6 +242,12 @@ public:
     /** Smoothed real-frame interval, milliseconds. 0 until established. */
     float intervalMs() const { return emaFrameMs_; }
 
+    /** Diagnostics: how much of each slot the spacing governor is allowing. */
+    float spacingScale() const { return spacingScale_; }
+    float capabilityFps() const {
+        return (emaWorkMs_ > 0.1f) ? 1000.0f / emaWorkMs_ : 0.0f;
+    }
+
 private:
     void updateSpacingGovernor(int hz);
     Tier selectTier(int mult, int hz) const;

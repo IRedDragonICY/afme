@@ -3057,9 +3057,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
     ctx.frameIdx++;
 
     if ((fc % 300) == 0) {
-        ALOGI("AFME: Frame %lu — %dx active (%d gen/frame), gen=%lu total",
+        ALOGI("AFME: Frame %lu — %dx active (%d gen/frame), gen=%lu total, "
+              "paceable=%d spacingScale=%.2f cap=%.1ffps interval=%.2fms",
               (unsigned long)fc, mult, numGenFrames,
-              (unsigned long)ctx.frameIdx);
+              (unsigned long)ctx.frameIdx, (int)tier.paceable,
+              ctx.pacer.spacingScale(), ctx.pacer.capabilityFps(),
+              ctx.pacer.intervalMs());
     }
 
     // ── FPS stats ────────────────────────────────────────────────────
