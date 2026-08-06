@@ -973,8 +973,8 @@ layout(binding=2) uniform highp sampler2D r_block_mv;
 layout(binding=3) uniform mediump sampler2D r_prev_mask;
 // r32f, NOT r8: ESSL 3.10 only guarantees rgba32f/rgba16f/r32f/rgba8/
 // rgba8_snorm/rgba*ui/r32ui/rgba*i/r32i as image formats. The Adreno compiler
-// rejects r8 ("not a legal layout qualifier id"), which failed the whole of
-// initMobFGSR and silently downgraded method=motion to extrapolation.
+// rejects r8, which failed the whole of initMobFGSR and silently downgraded
+// method=motion to extrapolation.
 layout(r32f, binding=0) writeonly uniform highp image2D rw_mask;
 uniform ivec2 lumaSize;
 uniform ivec2 blockSize;
@@ -983,75 +983,119 @@ uniform float mvThr;
 uniform float upRate;
 uniform float downRate;
 uniform float worldThr;
+uniform float structThr;
+
+float gradAt(mediump sampler2D t, ivec2 p, ivec2 lim) {
+    float l = texelFetch(t, clamp(p + ivec2(-1, 0), ivec2(0), lim), 0).x;
+    float r = texelFetch(t, clamp(p + ivec2( 1, 0), ivec2(0), lim), 0).x;
+    float u = texelFetch(t, clamp(p + ivec2( 0,-1), ivec2(0), lim), 0).x;
+    float d = texelFetch(t, clamp(p + ivec2( 0, 1), ivec2(0), lim), 0).x;
+    return abs(r - l) + abs(d - u);
+}
+
 void main() {
     ivec2 blk = ivec2(gl_GlobalInvocationID.xy);
     ivec2 maskSize = imageSize(rw_mask);
     if (any(greaterThanEqual(blk, maskSize))) return;
+    ivec2 lim = lumaSize - ivec2(1);
 
-    // What is the WORLD doing around this block? A HUD element is small next to
-    // this window, so the ring is world content even when the centre is UI.
+    // What is the WORLD doing around this block?
+    //
+    // Sampled at THREE scales, not one. A single tight ring only works for HUD
+    // smaller than the ring: for a block in the middle of the minimap every
+    // neighbour is still minimap, so the world reads as motionless, no evidence
+    // is gathered, and the interior of every large element stays unmasked while
+    // only its edges get protected. Strides of 3/10/24 blocks (24/80/192px at
+    // an 8px block) escape everything from a skill icon to a dialogue box.
     vec2  worldSum = vec2(0.0);
     float worldMag = 0.0;
     int   n = 0;
-    for (int dy = -3; dy <= 3; dy += 3) {
-        for (int dx = -3; dx <= 3; dx += 3) {
-            if (dx == 0 && dy == 0) continue;
-            ivec2 q = clamp(blk + ivec2(dx, dy), ivec2(0), maskSize - ivec2(1));
-            vec2 m = texelFetch(r_block_mv, q, 0).xy;
-            worldSum += m;
-            worldMag += length(m);
-            n++;
+    for (int ring = 0; ring < 3; ring++) {
+        int step = (ring == 0) ? 3 : ((ring == 1) ? 10 : 24);
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                ivec2 q = clamp(blk + ivec2(dx, dy) * step,
+                                ivec2(0), maskSize - ivec2(1));
+                vec2 m = texelFetch(r_block_mv, q, 0).xy;
+                worldSum += m;
+                worldMag += length(m);
+                n++;
+            }
         }
     }
     worldMag /= float(n);
     vec2 worldDir = (length(worldSum) > 1e-5) ? normalize(worldSum) : vec2(0.0);
 
-    // What is this block doing?
+    // STRUCTURE PERSISTENCE — the signal that survives transparency.
+    //
+    // Game HUD is semi-transparent: the world shows through it, so the
+    // COMPOSITED pixels genuinely move when the camera turns, block motion
+    // estimation reports real motion, and a rule that releases the mask on
+    // "moves with the world" therefore unmasks exactly the elements it was
+    // meant to protect — the more transparent the element, the faster it is
+    // released. That is why the icon row, the skill buttons and the party
+    // panel kept ghosting.
+    //
+    // What does NOT move is the element's own edge pattern: an icon outline
+    // sits on the SAME pixels in both frames, while world edges shift. So
+    // compare the gradient image at fixed screen positions instead of the
+    // colour. High edge energy that is identical frame to frame is
+    // screen-locked content, transparent or not.
     ivec2 c = blk * blockSize + blockSize / 2;
     float diff = 0.0;
+    float gCur = 0.0;
+    float gDif = 0.0;
     for (int dy = -2; dy <= 2; dy += 2) {
         for (int dx = -2; dx <= 2; dx += 2) {
-            ivec2 p = clamp(c + ivec2(dx, dy), ivec2(0), lumaSize - ivec2(1));
+            ivec2 p = clamp(c + ivec2(dx, dy), ivec2(0), lim);
             diff += abs(texelFetch(r_curr_luma, p, 0).x -
                         texelFetch(r_prev_luma, p, 0).x);
         }
     }
     diff /= 9.0;
+    for (int dy = -2; dy <= 2; dy += 4) {
+        for (int dx = -2; dx <= 2; dx += 4) {
+            ivec2 p = clamp(c + ivec2(dx, dy), ivec2(0), lim);
+            float a = gradAt(r_curr_luma, p, lim);
+            float b = gradAt(r_prev_luma, p, lim);
+            gCur += a;
+            gDif += abs(a - b);
+        }
+    }
+    gCur *= 0.25;
+    gDif *= 0.25;
+    // 1 = the edge pattern is identical to last frame, 0 = completely redrawn.
+    float structStable = 1.0 - clamp(gDif / max(gCur, 1e-4), 0.0, 1.0);
+    bool  hasStructure = gCur > structThr;
+
     vec2  mvPx  = texelFetch(r_block_mv, blk, 0).xy;
     float mvLen = length(mvPx);
     float prev  = texelFetch(r_prev_mask, blk, 0).x;
 
-    // "Is UI" is a SLOW, STICKY, SPATIAL property. "Is changing" is a fast
-    // temporal one. The previous version used a single accumulator for both,
-    // and that is precisely why animated HUD ghosted: the score required the
-    // block to be UNCHANGING, so a draining stamina ring, floating damage
-    // numbers, a cooldown sweep and the minimap rotating under a turning camera
-    // all failed the test and released the mask in two frames (-0.50/frame) —
-    // after which world motion vectors warped them. They are the exact elements
-    // users notice.
-    //
-    // The discriminator that actually separates UI from world is not stillness,
-    // it is being SCREEN-LOCKED: UI does not move when the world moves. So
-    // evidence is gathered only while the world is actually in motion, and the
-    // mask is released only by the one thing UI can never do — move WITH the
-    // world.
-    bool worldMoving  = worldMag > worldThr;
-    bool selfStill    = mvLen < mvThr;
+    bool worldMoving = worldMag > worldThr;
+    bool selfStill   = mvLen < mvThr;
+    bool locked      = hasStructure && structStable > 0.70;
+
+    // Release needs BOTH: it moves with the world AND its edges are being
+    // redrawn as it goes. Translucent HUD satisfies the first and never the
+    // second, which is precisely the case the previous rule got wrong.
     bool movesWithWorld = worldMoving && mvLen > mvThr &&
-                          dot(mvPx / max(mvLen, 1e-5), worldDir) > 0.7;
+                          dot(mvPx / max(mvLen, 1e-5), worldDir) > 0.7 &&
+                          structStable < 0.40;
 
     float m = prev;
     if (movesWithWorld) {
-        m -= downRate;                       // proven world content
-    } else if (worldMoving && selfStill) {
-        // Screen-locked while the world moves. Full credit when the pixels are
-        // also unchanging (static HUD), half credit when they are not — that
-        // half is what keeps ANIMATED HUD masked instead of ghosting.
-        m += (diff < lumaThr) ? upRate : upRate * 0.5;
+        m -= downRate;
+    } else if (worldMoving && (selfStill || locked)) {
+        // Full credit when the pixels are also unchanging (opaque static HUD),
+        // half credit otherwise — that half is what carries animated and
+        // translucent HUD, which changes every frame but never moves away.
+        m += (diff < lumaThr || (locked && selfStill)) ? upRate : upRate * 0.5;
     }
     // Otherwise the frame carries no information about this block (camera
-    // still, whole scene static) — hold the score rather than guess. Costs
-    // nothing: with no motion there is nothing for the warp to get wrong.
+    // still, whole scene static) — hold rather than guess. Costs nothing: with
+    // no motion there is nothing for the warp to get wrong.
 
     imageStore(rw_mask, blk, vec4(clamp(m, 0.0, 1.0)));
 })";
@@ -1422,6 +1466,10 @@ static void applyMobFGSRPrepare(AFMEContext& ctx) {
         // Below this the "world" is not moving enough for stillness to mean
         // anything, so the frame is treated as carrying no evidence either way.
         glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "worldThr"), 1.5f);
+        // Edge energy (sum of |dx|+|dy| luma differences, 0..~2) above which a
+        // block has a pattern worth tracking. Below it there is nothing to be
+        // stable ABOUT and flat sky would read as locked.
+        glUniform1f(glGetUniformLocation(ctx.hudMaskProg, "structThr"), 0.06f);
         glDispatchCompute(bgx, bgy, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     }
@@ -2839,8 +2887,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         // RESULT: same visual gain, motion estimation left honest.
         GLuint srcPrevTex = ctx.prevFrame.glTex;
         GLuint srcCurrTex = ctx.currFrame.glTex;
-        bool sharpen = sgsrMode >= 1 && ctx.sgsrInitialized &&
-                       ctx.sharpenedFrame.glTex;
+        // Modes: 0=off 1=SGSR1 2=SGSR2 3=legacy spelling of "use motion".
+        // Mode 3 is a GENERATION-METHOD request, not a sharpening one — `>= 1`
+        // ran the sharpen pass for it too, costing a full-res pass per synth
+        // frame and applying sharpening nobody asked for.
+        bool sharpen = (sgsrMode == 1 || sgsrMode == 2) &&
+                       ctx.sgsrInitialized && ctx.sharpenedFrame.glTex;
 
         // Motion estimation / dilation run ONCE per real frame; only the
         // warp is repeated per generated frame (3x/4x no longer pay ME 2-3×)
