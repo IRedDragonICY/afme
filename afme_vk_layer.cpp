@@ -2582,8 +2582,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_vkQueuePresentKHR(
         ctx.pacer.abortPresent(nowNs);
         ctx.stats.publish(nowNs);
         if ((fc % 300) == 0) {
-            ALOGI("AFME: no display headroom @ %dHz — passthrough",
-                  effectiveHz(ctx));
+            // Say WHY. "No headroom" is a conclusion, and the inputs that
+            // produced it — the capability estimate and the interval it came
+            // from — are the only things that distinguish a genuinely saturated
+            // panel from a capability estimate that has run away.
+            ALOGI("AFME: no display headroom @ %dHz — passthrough "
+                  "(cap=%.1ffps interval=%.2fms mult=%d fg=%d)",
+                  effectiveHz(ctx), ctx.pacer.capabilityFps(),
+                  ctx.pacer.intervalMs(), mult, (int)fgOn);
         }
         return next_vkQueuePresentKHR(queue, pPresentInfo);
     }
